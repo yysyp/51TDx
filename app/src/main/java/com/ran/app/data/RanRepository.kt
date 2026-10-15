@@ -1,0 +1,752 @@
+package com.ran.app.data
+
+import com.ran.app.core.DailyCycle
+import com.ran.app.core.PetEngine
+import com.ran.app.core.RewardEngine
+import com.ran.app.core.SpacedRepetition
+import com.ran.app.core.TimeUtils
+import com.ran.app.data.local.DrawRecordDao
+import com.ran.app.data.local.DrawRecordEntity
+import com.ran.app.data.local.FoodDao
+import com.ran.app.data.local.FoodEntity
+import com.ran.app.data.local.PlanCheckInDao
+import com.ran.app.data.local.PlanCheckInEntity
+import com.ran.app.data.local.PlanDao
+import com.ran.app.data.local.PlanEntity
+import com.ran.app.data.local.PlanStatus
+import com.ran.app.data.local.PetDao
+import com.ran.app.data.local.PetEntity
+import com.ran.app.data.local.PrizeDao
+import com.ran.app.data.local.PrizeEntity
+import com.ran.app.data.local.ReviewDao
+import com.ran.app.data.local.ReviewItemEntity
+import com.ran.app.data.local.ReviewLogDao
+import com.ran.app.data.local.ReviewLogEntity
+import com.ran.app.data.local.StarLedgerDao
+import com.ran.app.data.local.StarLedgerEntity
+import com.ran.app.data.local.TodoDao
+import com.ran.app.data.local.TodoEntity
+import java.time.LocalDate
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+
+/** Outcome of a plan check-in, surfaced to the UI for feedback messaging. */
+sealed interface CheckInResult {
+    data object AlreadyCheckedIn : CheckInResult
+    data class Progressed(val planId: Long, val current: Int, val target: Int) : CheckInResult
+    data class Completed(val planId: Long) : CheckInResult
+}
+
+sealed interface DrawResult {
+    data class Success(val record: DrawRecordEntity) : DrawResult
+    data object NotEnoughStars : DrawResult
+    data object EmptyPool : DrawResult
+}
+
+sealed interface ToggleTodoResult {
+    data class Completed(val starsGained: Int) : ToggleTodoResult
+    data class Reopened(val starsRefunded: Int) : ToggleTodoResult
+}
+
+/** Several cards created together from one multi-line entry. */
+data class BatchReviewRecord(
+    val starsGained: Int,
+    val created: Int,
+    val skipped: Int,
+    val tooLong: Int
+)
+
+/** Outcome of one graded review. */
+data class ReviewOutcome(
+    val starsGained: Int,
+    val nextDueDay: String,
+    val intervalDays: Int,
+    val mastered: Boolean,
+    /** True when the variable-ratio bonus fired; drives the celebratory copy. */
+    val bonus: Boolean,
+    val quality: SpacedRepetition.Quality
+)
+
+/** Result of one care interaction with the pet. */
+data class PetActionResult(
+    val ok: Boolean,
+    val spokenLine: String,
+    val banner: String,
+    val starsSpent: Int,
+    val hunger: Int,
+    val mood: Int,
+    val evolvedTo: com.ran.app.core.PetEngine.Stage?
+)
+
+/** Result of buying or equipping an accessory. */
+data class PetPurchaseResult(
+    val ok: Boolean,
+    val message: String,
+    val starsSpent: Int,
+    val equippedNow: String
+)
+
+/** Today's review standing, for the header card. */
+data class ReviewSummary(
+    val dueCount: Int = 0,
+    val doneToday: Int = 0,
+    val streak: Int = 0,
+    val starsToday: Int = 0,
+    val totalCards: Int = 0,
+    val masteredCount: Int = 0
+)
+
+/**
+ * Single entry point for all persistence and reward accounting.
+ *
+ * Star mutations are serialised through [awardStars]/[spendStars] so the
+ * running balance in the ledger stays consistent even under rapid tapping.
+ */
+class RanRepository(
+    private val prizeDao: PrizeDao,
+    private val drawRecordDao: DrawRecordDao,
+    private val planDao: PlanDao,
+    private val planCheckInDao: PlanCheckInDao,
+    private val todoDao: TodoDao,
+    private val foodDao: FoodDao,
+    private val petDao: PetDao,
+    private val reviewDao: ReviewDao,
+    private val reviewLogDao: ReviewLogDao,
+    private val starLedgerDao: StarLedgerDao
+) {
+
+    companion object {
+        /**
+         * One card must fit in working memory: roughly four chunks, ~15 words.
+         * Anything longer cannot be recalled, only recognised, and recognition
+         * masquerades as knowing.
+         */
+        const val MAX_CARD_LENGTH = 80
+
+        /** Cap per submission so one pasted essay cannot mint a fortune. */
+        const val MAX_CARDS_PER_BATCH = 12
+
+        private val SENTENCE_SPLIT = Regex("[\\n;；。!！?？]+")
+    }
+
+    /**
+     * The local day key as a stream, not a value.
+     *
+     * Every "today" surface used to read this once and cache it, while data
+     * flows only emit when the database changes. Nothing changes at midnight,
+     * so yesterday's key survived the night and a finished check-in stayed
+     * greyed out until some unrelated write refreshed it. Emitting the key on
+     * its own schedule decouples the day boundary from writes.
+     *
+     * Polling rather than sleeping exactly until midnight: the clock can also
+     * jump (manual edit, timezone change, travel), and only re-reading it
+     * catches that.
+     */
+    val todayKey: Flow<String> = flow {
+        while (true) {
+            emit(TimeUtils.todayKey())
+            delay(DailyCycle.millisUntilNextLocalDay().coerceAtMost(30_000L))
+        }
+    }.distinctUntilChanged()
+
+    // ---------- Star economy ----------
+
+    val starBalance: Flow<Int> = starLedgerDao.observeBalance()
+    val recentStarEntries: Flow<List<StarLedgerEntity>> = starLedgerDao.observeRecent()
+    val activeDayCount: Flow<Int> = starLedgerDao.observeActiveDays()
+    val distinctCheckInDays: Flow<List<String>> = starLedgerDao.observeDistinctDays()
+
+    suspend fun currentBalance(): Int = starLedgerDao.balanceOnce()
+
+    /** Grants [amount] stars and records the resulting balance. */
+    suspend fun awardStars(amount: Int, reason: String): Int {
+        if (amount <= 0) return currentBalance()
+        val balance = currentBalance() + amount
+        starLedgerDao.insert(
+            StarLedgerEntity(
+                delta = amount,
+                balanceAfter = balance,
+                reason = reason,
+                createdAt = TimeUtils.now()
+            )
+        )
+        return balance
+    }
+
+    /** Deducts [amount] stars. Returns false (and changes nothing) if unaffordable. */
+    suspend fun spendStars(amount: Int, reason: String): Boolean {
+        if (amount <= 0) return true
+        val balance = currentBalance()
+        if (balance < amount) return false
+        starLedgerDao.insert(
+            StarLedgerEntity(
+                delta = -amount,
+                balanceAfter = balance - amount,
+                reason = reason,
+                createdAt = TimeUtils.now()
+            )
+        )
+        return true
+    }
+
+    // ---------- Lottery ----------
+
+    val prizes: Flow<List<PrizeEntity>> = prizeDao.observeAll()
+    val drawRecords: Flow<List<DrawRecordEntity>> = drawRecordDao.observeRecent()
+
+    suspend fun savePrize(prize: PrizeEntity): Long =
+        if (prize.id == 0L) prizeDao.insert(prize) else { prizeDao.update(prize); prize.id }
+
+    suspend fun deletePrize(prize: PrizeEntity) = prizeDao.delete(prize)
+
+    /**
+     * Performs a weighted random draw. The star cost is taken from the drawn
+     * prize, which is known before the spend happens so the charge always
+     * matches the reward the user actually receives.
+     */
+    suspend fun drawPrize(): DrawResult {
+        val pool = prizeDao.activeOnce()
+        if (pool.isEmpty()) return DrawResult.EmptyPool
+        val winner = RewardEngine.weightedPick(pool, { it.weight }) ?: return DrawResult.EmptyPool
+        if (!spendStars(winner.starCost, "抽奖：${winner.title}")) return DrawResult.NotEnoughStars
+        // Jackpot is defined relative to pool cost so it stays meaningful as the user edits prizes.
+        val avgCost = pool.map { it.starCost }.average().coerceAtLeast(1.0)
+        val isJackpot = winner.starCost >= avgCost * 1.8
+        val record = DrawRecordEntity(
+            prizeTitle = winner.title,
+            prizeEmoji = winner.emoji,
+            starCost = winner.starCost,
+            isJackpot = isJackpot,
+            createdAt = TimeUtils.now()
+        )
+        drawRecordDao.insert(record)
+        return DrawResult.Success(record)
+    }
+
+    // ---------- Plans ----------
+
+    val activePlans: Flow<List<PlanEntity>> = planDao.observeActive()
+    val completedPlans: Flow<List<PlanEntity>> = planDao.observeCompleted()
+
+    fun checkInsForPlan(planId: Long): Flow<List<PlanCheckInEntity>> =
+        planCheckInDao.observeForPlan(planId)
+
+    val allCheckIns: Flow<List<PlanCheckInEntity>> = planCheckInDao.observeAll()
+
+    suspend fun savePlan(plan: PlanEntity): Long =
+        if (plan.id == 0L) planDao.insert(plan) else { planDao.update(plan); plan.id }
+
+    suspend fun deletePlan(plan: PlanEntity) = planDao.delete(plan)
+
+    /**
+     * Records one check-in. The unique index on (planId, dayKey) makes repeat
+     * taps on the same day a no-op instead of a star farm.
+     */
+    suspend fun checkIn(planId: Long): CheckInResult {
+        val plan = planDao.byId(planId) ?: return CheckInResult.AlreadyCheckedIn
+        if (plan.status == PlanStatus.COMPLETED) return CheckInResult.AlreadyCheckedIn
+        val today = TimeUtils.todayKey()
+        if (planCheckInDao.countForPlanOnDay(planId, today) > 0) return CheckInResult.AlreadyCheckedIn
+
+        planCheckInDao.insert(PlanCheckInEntity(planId = planId, dayKey = today, createdAt = TimeUtils.now()))
+        val nextCount = plan.currentCount + 1
+        if (nextCount >= plan.targetCount) {
+            planDao.bumpCount(planId, PlanStatus.COMPLETED, TimeUtils.now())
+            awardStars(RewardEngine.STAR_PLAN_COMPLETE + RewardEngine.STAR_CHECK_IN, "完成计划：${plan.title}")
+            return CheckInResult.Completed(planId)
+        }
+        planDao.bumpCount(planId, PlanStatus.ACTIVE, null)
+        awardStars(RewardEngine.STAR_CHECK_IN, "打卡：${plan.title}")
+        return CheckInResult.Progressed(planId, nextCount, plan.targetCount)
+    }
+
+    /** Current length of the daily check-in streak, including today if present. */
+    suspend fun computeStreak(days: List<String>): Int {
+        if (days.isEmpty()) return 0
+        val today = TimeUtils.todayKey()
+        val sorted = days.sortedDescending()
+        // Anchor on today when checked in, otherwise on yesterday so the streak
+        // is not reported as broken before the day is actually over.
+        var cursor = if (sorted.first() == today) today else TimeUtils.todayKey(TimeUtils.now() - 86_400_000L)
+        var streak = 0
+        for (day in sorted) {
+            val gap = TimeUtils.daysBetweenKeys(day, cursor)
+            if (gap == 0L) {
+                streak++
+                cursor = TimeUtils.todayKey(TimeUtils.now() - (streak * 86_400_000L))
+            } else if (gap > 0L) {
+                break
+            }
+        }
+        return streak
+    }
+
+    // ---------- Todos ----------
+
+    val openTodos: Flow<List<TodoEntity>> = todoDao.observeOpen()
+    val completedTodos: Flow<List<TodoEntity>> = todoDao.observeCompleted()
+
+    suspend fun saveTodo(todo: TodoEntity): Long =
+        if (todo.id == 0L) todoDao.insert(todo) else { todoDao.update(todo); todo.id }
+
+    suspend fun deleteTodo(todo: TodoEntity) = todoDao.delete(todo)
+
+    /**
+     * Marks a todo done or reopens it. Reopening refunds the stars so the
+     * ledger stays a truthful record of earned reward.
+     */
+    suspend fun toggleTodo(todo: TodoEntity): ToggleTodoResult? {
+        if (!todo.isDone) {
+            todoDao.update(
+                todo.copy(isDone = true, completedAt = TimeUtils.now())
+            )
+            awardStars(todo.starReward, "完成任务：${todo.title}")
+            return ToggleTodoResult.Completed(todo.starReward)
+        }
+        todoDao.update(todo.copy(isDone = false, completedAt = null))
+        // Refund the stars originally granted. Guarded against a negative balance
+        // so the ledger can never show a negative balance if data was edited.
+        val balance = currentBalance()
+        val refund = todo.starReward.coerceAtMost(balance)
+        if (refund > 0) {
+            starLedgerDao.insert(
+                StarLedgerEntity(
+                    delta = -refund,
+                    balanceAfter = balance - refund,
+                    reason = "撤销任务：${todo.title}",
+                    createdAt = TimeUtils.now()
+                )
+            )
+        }
+        return ToggleTodoResult.Reopened(refund)
+    }
+
+    // ---------- Food picker ----------
+
+    val foods: Flow<List<FoodEntity>> = foodDao.observeActive()
+
+    suspend fun saveFood(food: FoodEntity): Long =
+        if (food.id == 0L) foodDao.insert(food) else { foodDao.update(food); food.id }
+
+    suspend fun deleteFood(food: FoodEntity) = foodDao.delete(food)
+
+    suspend fun pickFood(): FoodEntity? {
+        val pool = foodDao.activeOnce()
+        return RewardEngine.weightedPick(pool, { 1 })
+    }
+    // ---------- Pet ----------
+
+    /**
+     * The companion state as it stands right now.
+     *
+     * Decay is applied on read and never written back until an action occurs,
+     * because it is a pure function of [PetEntity.lastTickAt]. Persisting decay
+     * on every tick would both spam the database and double-charge elapsed time
+     * whenever the same row was touched twice.
+     */
+    val pet: Flow<PetEntity?> = combine(petDao.observe(), everyThirtySeconds()) { row, _ -> row }
+        .map { row ->
+            row?.let {
+                val now = TimeUtils.now()
+                val (hunger, mood) = PetEngine.snapshotted(it.hunger, it.mood, it.lastTickAt, now)
+                it.copy(hunger = hunger, mood = mood)
+            }
+        }
+
+    /** Creates the companion on first launch and after any schema rebuild. */
+    suspend fun ensurePet() {
+        if (petDao.once() == null) petDao.upsert(PetEntity())
+    }
+
+    /**
+     * Spends stars on one care action and applies its effect.
+     *
+     * Growth comes from care actions, never from the amount paid, so buying the
+     * priciest snack repeatedly is not a shortcut to evolution — the intent is
+     * that showing up regularly is the only way to raise it.
+     */
+    suspend fun performPetAction(action: PetEngine.Action): PetActionResult {
+        val row = petDao.once() ?: PetEntity().also { petDao.upsert(it) }
+        val now = TimeUtils.now()
+        val (hungerBefore, moodBefore) = PetEngine.snapshotted(row.hunger, row.mood, row.lastTickAt, now)
+
+        if (!spendStars(action.cost, "宠物·${action.label}")) {
+            val begLine = PetEngine.begLine(hungerBefore)
+            return PetActionResult(
+                ok = false,
+                spokenLine = begLine.ifBlank { "想给你买更好的东西…可是星星不够了 🥺" },
+                banner = "星星不够啦，去完成任务赚星星吧",
+                starsSpent = 0,
+                hunger = hungerBefore,
+                mood = moodBefore,
+                evolvedTo = null
+            )
+        }
+
+        val hunger = PetEngine.clamp(hungerBefore + action.hungerDelta)
+        val mood = PetEngine.clamp(moodBefore + action.moodDelta)
+        val care = row.careCount + action.carePoints
+        val stageBefore = PetEngine.Stage.forCare(row.careCount)
+        val stageAfter = PetEngine.Stage.forCare(care)
+
+        petDao.upsert(
+            row.copy(
+                hunger = hunger,
+                mood = mood,
+                careCount = care,
+                lastTickAt = now,
+                lastActionAt = now
+            )
+        )
+
+        val expression = PetEngine.expression(
+            hunger = hunger,
+            mood = mood,
+            minutesSinceLastAction = 0,
+            justAte = action.hungerDelta > 0
+        )
+        return PetActionResult(
+            ok = true,
+            spokenLine = PetEngine.lineFor(expression, row.name),
+            banner = if (stageAfter != stageBefore) "${row.name} 长大了！变成${stageAfter.label} 🎉" else "",
+            starsSpent = action.cost,
+            hunger = hunger,
+            mood = mood,
+            evolvedTo = if (stageAfter != stageBefore) stageAfter else null
+        )
+    }
+
+    /**
+     * Buys an accessory, or equips it free if already owned.
+     *
+     * Owning something you have already earned and then *choosing* to wear it
+     * is the part that builds attachment, so paying again is never required.
+     */
+    suspend fun purchaseAccessory(id: String): PetPurchaseResult {
+        val row = petDao.once() ?: return PetPurchaseResult(false, "宠物还没准备好", 0, "")
+        val accessory = PetEngine.accessoryOf(id)
+            ?: return PetPurchaseResult(false, "没有这个装扮", 0, "")
+
+        val owned = ownedSet(row.ownedCsv)
+        if (owned.contains(id)) {
+            equipAccessory(id)
+            val worn = equippedIds(row)
+            return PetPurchaseResult(true, "「${accessory.name}」${if (worn.contains(id)) "戴上啦" else "摘下来了"}", 0, id)
+        }
+
+        if (!spendStars(accessory.price, "宠物装扮·${accessory.name}")) {
+            return PetPurchaseResult(
+                false,
+                "还差 ${accessory.price - currentBalance()} 颗星星，继续加油！",
+                0,
+                ""
+            )
+        }
+        petDao.upsert(row.copy(ownedCsv = (owned + id).joinToString(",")))
+        equipAccessory(id)
+        return PetPurchaseResult(true, "「${accessory.name}」买下了，已经戴好 ✨", accessory.price, id)
+    }
+
+    /** Toggles one accessory in its slot; each slot holds at most one item. */
+    suspend fun equipAccessory(id: String) {
+        val row = petDao.once() ?: return
+        val accessory = PetEngine.accessoryOf(id) ?: return
+        val worn = equippedIds(row)
+        val removing = worn.contains(id)
+        petDao.upsert(
+            when (accessory.slot) {
+                PetEngine.Slot.HAT -> row.copy(equippedHat = if (removing) "" else id)
+                PetEngine.Slot.FACE -> row.copy(equippedFace = if (removing) "" else id)
+                PetEngine.Slot.NECK -> row.copy(equippedNeck = if (removing) "" else id)
+                PetEngine.Slot.BACK -> row.copy(equippedBack = if (removing) "" else id)
+            }
+        )
+    }
+
+    suspend fun renamePet(rawName: String) {
+        val row = petDao.once() ?: return
+        val name = rawName.trim().take(12)
+        if (name.isBlank()) return
+        petDao.upsert(row.copy(name = name))
+    }
+
+    private fun ownedSet(csv: String): Set<String> =
+        csv.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+
+    private fun equippedIds(row: PetEntity): Set<String> =
+        setOf(row.equippedHat, row.equippedFace, row.equippedNeck, row.equippedBack)
+            .filter { it.isNotBlank() }
+            .toSet()
+
+    private fun everyThirtySeconds(): Flow<Long> = flow {
+        while (true) {
+            emit(TimeUtils.now())
+            delay(30_000L)
+        }
+    }
+    // ---------- Review (spaced repetition) ----------
+
+    /** Every item still in rotation, oldest learning first. */
+    val reviewItems: Flow<List<ReviewItemEntity>> = reviewDao.observeActive()
+
+    /**
+     * Today's queue, oldest first.
+     *
+     * The day comes from [todayKey], so a screen left open across midnight
+     * rolls over to tomorrow's list on its own instead of showing yesterday's.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val dueReviews: Flow<List<ReviewItemEntity>> =
+        todayKey.flatMapLatest { day -> reviewDao.observeDue(day) }
+
+    suspend fun countDueReviews(): Int = reviewDao.countDue(TimeUtils.todayKey())
+
+    /**
+     * Records everything the user typed, splitting it into recall-sized cards.
+     *
+     * Splitting is not cosmetic — it is the working-memory constraint itself.
+     * A card that cannot be held in mind in one breath cannot be *retrieved*,
+     * and retrieval is the only part of review that consolidates memory. A
+     * 400-character block quote would be silently "reviewed" by recognising it,
+     * which produces the sensation of learning without the storage.
+     *
+     * Newlines and sentence terminators are treated as boundaries, and each
+     * piece is capped, so one paste becomes several honest little cards.
+     */
+    suspend fun recordReviews(
+        rawText: String,
+        difficulty: SpacedRepetition.Difficulty
+    ): BatchReviewRecord {
+        val allLines = rawText.split(SENTENCE_SPLIT)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val lines = allLines.take(MAX_CARDS_PER_BATCH)
+        if (lines.isEmpty()) return BatchReviewRecord(starsGained = 0, created = 0, skipped = 0, tooLong = 0)
+
+        val tooLong = lines.count { it.length > MAX_CARD_LENGTH }
+        var stars = 0
+        lines.forEach { content ->
+            val clamped = content.take(MAX_CARD_LENGTH)
+            val now = TimeUtils.now()
+            reviewDao.insert(
+                ReviewItemEntity(
+                    content = clamped,
+                    difficulty = difficulty.level,
+                    ease = difficulty.initialEase,
+                    createdAt = now,
+                    nextDueDay = SpacedRepetition.initialDueDay(now)
+                )
+            )
+            val gained = SpacedRepetition.starsForRecording(difficulty)
+            awardStars(gained, "记录学习内容：${clamped.take(30)}")
+            stars += gained
+        }
+        return BatchReviewRecord(
+            starsGained = stars,
+            created = lines.size,
+            skipped = (allLines.size - lines.size).coerceAtLeast(0),
+            tooLong = tooLong
+        )
+    }
+
+    /**
+     * Grades one review and reschedules the card.
+     *
+     * Note that the card is updated *before* the star grant, and both are plain
+     * sequential suspends: a double tap on the same card is stopped upstream by
+     * the day-key comparison rather than by a mutex, which also survives a
+     * process restart.
+     */
+    suspend fun gradeReview(
+        item: ReviewItemEntity,
+        quality: SpacedRepetition.Quality
+    ): ReviewOutcome {
+        val now = TimeUtils.now()
+        val difficulty = SpacedRepetition.Difficulty.of(item.difficulty)
+        val outcome = SpacedRepetition.applyReview(
+            progress = SpacedRepetition.Progress(
+                repetitions = item.repetitions,
+                lapses = item.lapses,
+                intervalDays = item.intervalDays,
+                ease = item.ease
+            ),
+            quality = quality,
+            difficulty = difficulty,
+            reviewedAtMillis = now
+        )
+        val bonus = quality != SpacedRepetition.Quality.FORGOT && RewardEngine.rollReviewBonus()
+        val stars = if (bonus) outcome.stars * RewardEngine.REVIEW_BONUS_MULTIPLIER else outcome.stars
+
+        reviewDao.update(
+            item.copy(
+                stage = item.stage + 1,
+                repetitions = outcome.repetitions,
+                lapses = outcome.lapses,
+                intervalDays = outcome.intervalDays,
+                ease = outcome.ease,
+                lastReviewedAt = now,
+                nextDueDay = outcome.nextDueDay,
+                isMastered = outcome.isMastered
+            )
+        )
+        reviewLogDao.insert(
+            ReviewLogEntity(
+                reviewItemId = item.id,
+                reviewedDay = TimeUtils.todayKey(now),
+                qualityScore = quality.score,
+                starsGained = stars,
+                reviewedAt = now
+            )
+        )
+        awardStars(stars, "复习：${item.content.take(30)}")
+        return ReviewOutcome(
+            starsGained = stars,
+            nextDueDay = outcome.nextDueDay,
+            intervalDays = outcome.intervalDays,
+            mastered = outcome.isMastered,
+            bonus = bonus,
+            quality = quality
+        )
+    }
+
+    /**
+     * Aggregate displayed on the review screen's header.
+     *
+     * The streak is derived from distinct review days rather than a stored
+     * counter, so a missed day is discovered rather than silently carried.
+     */
+    val reviewSummary: Flow<ReviewSummary> = combine(
+        dueReviews,
+        reviewLogDao.observeReviewDays()
+    ) { due, days ->
+        val today = TimeUtils.todayKey()
+        ReviewSummary(
+            dueCount = due.size,
+            doneToday = reviewLogDao.countReviewsOnDay(today),
+            streak = computeStreak(days),
+            starsToday = reviewLogDao.starsOnDay(today),
+            totalCards = reviewDao.countActive(),
+            masteredCount = reviewDao.countMastered()
+        )
+    }
+
+    // The streak maths already exists above for check-ins and follows exactly
+    // the same rule (anchored on today, falling back to yesterday), so it is
+    // reused rather than duplicated — two slowly diverging streak definitions
+    // would eventually report different numbers for the same day.
+    suspend fun deleteReviewItem(item: ReviewItemEntity) = reviewDao.delete(item)
+
+    // ---------- Seeding ----------
+
+    /** Seeds a starter pool on first launch so the app is usable immediately. */
+    suspend fun seedIfEmpty() {
+        if (prizeDao.count() == 0) {
+            listOf(
+                // 小额高频：让抽奖经常有"到手"的实感
+                PrizeEntity(title = "小零食1份", description = "挑一个喜欢的", emoji = "🍪", weight = 22, starCost = 4),
+                PrizeEntity(title = "小水果1份", description = "当季水果", emoji = "🍎", weight = 24, starCost = 3),
+                PrizeEntity(title = "一杯饮料", description = "想喝什么自己选", emoji = "🥤", weight = 20, starCost = 5),
+                PrizeEntity(title = "免家务1次", description = "这次爸妈来做", emoji = "🧹", weight = 14, starCost = 8),
+                // 安慰奖：成本 0，不扣星星，也不算中奖
+                PrizeEntity(title = "谢谢惠顾", description = "这次没中，下次好运", emoji = "🍀", weight = 10, starCost = 0),
+                PrizeEntity(title = "屏幕时间+15分钟", description = "做完正事再玩", emoji = "📱", weight = 18, starCost = 5),
+                PrizeEntity(title = "屏幕时间+30分钟", description = "认真玩，不内疚", emoji = "🎮", weight = 13, starCost = 10),
+                PrizeEntity(title = "冰淇淋券1张", description = "饭后吃", emoji = "🍦", weight = 12, starCost = 8),
+                PrizeEntity(title = "屏幕时间+1小时", description = "周末可用", emoji = "🕹", weight = 8, starCost = 18),
+                PrizeEntity(title = "点外卖", description = "今天不做饭", emoji = "🥡", weight = 7, starCost = 18),
+                // 中档：需要攒一两天
+                PrizeEntity(title = "零花钱+5", description = "存起来也行", emoji = "💰", weight = 11, starCost = 12),
+                PrizeEntity(title = "奶茶券1张", description = "少糖更好", emoji = "🧋", weight = 10, starCost = 12),
+                PrizeEntity(title = "周末晚睡15分钟", description = "仅限周末", emoji = "🌙", weight = 9, starCost = 12),
+                PrizeEntity(title = "自选周末午餐", description = "你说了算", emoji = "🍱", weight = 9, starCost = 15),
+                PrizeEntity(title = "零花钱+10", description = "自己支配", emoji = "💵", weight = 7, starCost = 22),
+                PrizeEntity(title = "邀请同学来家玩（家长安排）", description = "提前约时间", emoji = "🧸", weight = 5, starCost = 25),
+                PrizeEntity(title = "买一本想要的书", description = "看完聊聊", emoji = "📚", weight = 5, starCost = 28),
+                PrizeEntity(title = "一场电影", description = "选片一起看", emoji = "🎬", weight = 4, starCost = 30),
+                PrizeEntity(title = "零花钱+15", description = "想好了再花", emoji = "💳", weight = 4, starCost = 32),
+                PrizeEntity(title = "吃大餐", description = "全家一起", emoji = "🍽", weight = 3, starCost = 35),
+                // 大奖：低概率，抽中即"头奖"（售价 >= 池子均价 1.8 倍）
+                PrizeEntity(title = "零花钱+20", description = "大额，好好计划", emoji = "🧧", weight = 2, starCost = 42),
+                PrizeEntity(title = "周末半日游", description = "去哪儿你定", emoji = "🚗", weight = 2, starCost = 50),
+                PrizeEntity(title = "中等玩具", description = "不超预算", emoji = "🎁", weight = 1, starCost = 55)
+            ).forEach { prizeDao.insert(it) }
+        }
+        if (foodDao.count() == 0) {
+            listOf(
+                // 蛋与豆制品
+                FoodEntity(name = "西红柿炒鸡蛋", category = "6-8月", emoji = "🍅"),
+                FoodEntity(name = "韭菜炒鸡蛋", category = "3-5月", emoji = "🌿"),
+                FoodEntity(name = "丝瓜炒蛋", category = "6-9月", emoji = "🥒"),
+                FoodEntity(name = "蒸水蛋", category = "全年（鸡蛋）", emoji = "🥚"),
+                FoodEntity(name = "麻婆豆腐", category = "全年（豆腐、豆瓣酱）", emoji = "🌶"),
+                FoodEntity(name = "家常豆腐", category = "全年（豆腐）", emoji = "🧈"),
+                FoodEntity(name = "香干炒肉", category = "全年（香干/豆腐干）", emoji = "🍖"),
+                FoodEntity(name = "虾仁豆腐蒸蛋", category = "全年（鸡蛋、豆腐、虾）", emoji = "🦐"),
+                FoodEntity(name = "西葫芦炒鸡蛋", category = "4-7月（春夏）", emoji = "🥒"),
+                // 猪肉牛肉
+                FoodEntity(name = "青椒炒肉", category = "6-9月", emoji = "🫑"),
+                FoodEntity(name = "回锅肉", category = "全年（蒜苗冬春季3-4月）", emoji = "🥓"),
+                FoodEntity(name = "鱼香肉丝", category = "全年", emoji = "🥢"),
+                FoodEntity(name = "红烧肉", category = "全年", emoji = "🍖"),
+                FoodEntity(name = "土豆炖牛腩", category = "全年（土豆耐储，6-10月）", emoji = "🥔"),
+                FoodEntity(name = "胡萝卜炖牛腩", category = "9-11月", emoji = "🥕"),
+                FoodEntity(name = "蒜苔炒肉", category = "4-5月", emoji = "🥬"),
+                FoodEntity(name = "芹菜炒肉", category = "10-2月", emoji = "🥬"),
+                FoodEntity(name = "木耳炒肉", category = "全年（干货木耳全年）", emoji = "🍄"),
+                FoodEntity(name = "四季豆炒肉", category = "5-10月", emoji = "🫛"),
+                FoodEntity(name = "肉末豆角", category = "7-10月", emoji = "🫛"),
+                FoodEntity(name = "肉末烧扁豆", category = "7-11月", emoji = "🫛"),
+                FoodEntity(name = "莴笋炒肉丝", category = "9-11月", emoji = "🥬"),
+                FoodEntity(name = "腊肉炒红菜苔", category = "10-2月", emoji = "🥓"),
+                FoodEntity(name = "冬笋炒腊肉", category = "10-2月", emoji = "🎍"),
+                FoodEntity(name = "腐竹烧木耳", category = "全年", emoji = "🍄"),
+                // 鸡鸭
+                FoodEntity(name = "可乐鸡翅", category = "全年", emoji = "🍗"),
+                FoodEntity(name = "辣子鸡", category = "全年（辣椒6-9月）", emoji = "🌶"),
+                FoodEntity(name = "口水鸡", category = "全年", emoji = "🍗"),
+                // 汤
+                FoodEntity(name = "香菇鸡汤", category = "全年（香菇干货全年）", emoji = "🍄"),
+                FoodEntity(name = "西红柿鸡蛋汤", category = "6-8月", emoji = "🍲"),
+                FoodEntity(name = "紫菜蛋花汤", category = "全年（紫菜干货）", emoji = "🍜"),
+                FoodEntity(name = "冬瓜排骨汤", category = "6-9月", emoji = "🍲"),
+                FoodEntity(name = "玉米排骨汤", category = "7-9月（嫩玉米7-8月）", emoji = "🌽"),
+                FoodEntity(name = "萝卜牛腩汤", category = "9-12月（秋冬白萝卜）", emoji = "🥕"),
+                FoodEntity(name = "丝瓜蛋汤", category = "6-9月", emoji = "🥒"),
+                // 河海鲜
+                FoodEntity(name = "清蒸鱼", category = "全年", emoji = "🐟"),
+                FoodEntity(name = "清蒸鲈鱼", category = "12-2月", emoji = "🐠"),
+                FoodEntity(name = "白灼虾", category = "全年", emoji = "🦐"),
+                FoodEntity(name = "小龙虾", category = "6-8月", emoji = "🦞"),
+                FoodEntity(name = "对虾/基围虾", category = "8-10月", emoji = "🦐"),
+                FoodEntity(name = "大闸蟹", category = "9-12月", emoji = "🦀"),
+                FoodEntity(name = "皮皮虾", category = "3-5月", emoji = "🦐"),
+                FoodEntity(name = "扇贝", category = "9-11月", emoji = "🐚"),
+                FoodEntity(name = "鲍鱼", category = "7-8月", emoji = "🐚"),
+                FoodEntity(name = "生蚝/牡蛎", category = "12-3月", emoji = "🦪"),
+                FoodEntity(name = "花蛤", category = "6-8月", emoji = "🐚"),
+                // 素菜
+                FoodEntity(name = "酸辣土豆丝", category = "全年（土豆耐储）", emoji = "🥔"),
+                FoodEntity(name = "手撕包菜", category = "全年（卷心菜冬春为主）", emoji = "🥬"),
+                FoodEntity(name = "蒜蓉西兰花", category = "9-11月", emoji = "🥦"),
+                FoodEntity(name = "地三鲜", category = "6-8月（茄子、青椒、土豆）", emoji = "🍆"),
+                FoodEntity(name = "干煸豆角", category = "6-9月", emoji = "🫛"),
+                FoodEntity(name = "茄子豆角", category = "6-9月", emoji = "🍆"),
+                FoodEntity(name = "红烧茄子", category = "6-8月", emoji = "🍆"),
+                FoodEntity(name = "凉拌黄瓜", category = "5-8月", emoji = "🥒"),
+                FoodEntity(name = "凉拌西红柿", category = "6-8月", emoji = "🍅"),
+                FoodEntity(name = "蚝油生菜", category = "全年", emoji = "🥬"),
+                FoodEntity(name = "蒜蓉油麦菜", category = "4-6和9-10月", emoji = "🥬"),
+                // 主食与硬菜
+                FoodEntity(name = "蛋炒饭", category = "全年", emoji = "🍚"),
+                FoodEntity(name = "西红柿鸡蛋面", category = "6-8月", emoji = "🍜"),
+                FoodEntity(name = "煎牛排", category = "全年", emoji = "🥩"),
+                FoodEntity(name = "烤羊排", category = "全年", emoji = "🍖")
+            ).forEach { foodDao.insert(it) }
+        }
+    }
+}

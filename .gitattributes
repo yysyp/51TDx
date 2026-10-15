@@ -1,0 +1,10 @@
+# Normalise line endings so a cross-platform checkout does not churn every file.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF, or cmd.exe misreads them.
+*.bat text eol=crlf
+
+# Binaries
+*.jar binary
+*.png binary
+*.apk binary

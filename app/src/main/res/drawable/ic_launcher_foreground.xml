@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Sun / energy ring, expresses the "positive feedback loop" idea. -->
+    <path
+        android:fillColor="#FFD166"
+        android:pathData="M54,26m-11,0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0" />
+    <!-- Five-point star badge. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,40 L60.2,55.1 L76,57.3 L63.8,68.2 L67,84 L54,75.6 L41,84 L44.2,68.2 L32,57.3 L47.8,55.1 Z" />
+    <path
+        android:fillColor="#FF6B4E"
+        android:pathData="M54,48 L57.7,57.1 L67.3,58.4 L60.1,65 L62.2,74.5 L54,69.6 L45.8,74.5 L47.9,65 L40.7,58.4 L50.3,57.1 Z" />
+</vector>
