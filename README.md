@@ -60,9 +60,12 @@ that is hard to reach stops behaving as a reward.
 | Review completed | +1 to +6 (difficulty x recall quality), ~15% chance of doubling |
 | First-run gift | +10 |
 
-Stars are also *spent*: pet care costs 5-12 stars per interaction and
-accessories cost 15-70 stars once. Without a sink, a currency inflates and
+Stars are also *spent*: pet care costs 3-12 stars per interaction and
+accessories cost 15-72 stars once. Without a sink, a currency inflates and
 stops motivating — the pet exists to make those stars go somewhere durable.
+
+The cheapest action costs 3 so that even a day with almost no earnings can
+still afford a hello; a pet you cannot greet cheaply is a pet you stop visiting.
 
 All star movements are written to an append-only `star_ledger` table, so the
 balance is always derivable and auditable. Spending is refused when the
@@ -150,7 +153,7 @@ Without `GRADLE_HOME` they fall back to `./gradlew`.
 
 ## Tests
 
-**54 tests, all green** (run for both the debug and release variants):
+**63 tests, all green** (run for both the debug and release variants):
 
 - `RewardEngineTest.kt` (16) — the reward economy, the part that silently
   corrupts the whole feedback loop if it drifts:
@@ -162,10 +165,21 @@ Without `GRADLE_HOME` they fall back to `./gradlew`.
   earned, ease bounds, strict interval growth even at minimum ease, mastery
   defined by interval length, harder material graduating later, failure still
   paying something, and the observed bonus rate matching the advertised 15%.
-- `PetEngineTest.kt` (15) — decay rates (hunger ~20h, mood ~40h), no
+- `PetEngineTest.kt` (24) — decay rates (hunger ~20h, mood ~40h), no
   double-charging elapsed time, negative clock deltas not restoring state,
   expression precedence (eating > absence > hunger > mood), dialogue variety,
   catalogue integrity, and that twice-daily care actually keeps it content.
+  Plus: levels that never stop growing even past the final stage, level-range
+  consistency for every possible care count, every accessory slot stocking both
+  an affordable first buy and something rare to save toward, default anchors
+  staying inside the frame, and per-accessory drag offsets — round-tripping,
+  item independence, clamping a wild fling, and skipping corrupt data.
+
+  Two of those guard regressions rather than maths. The level tests exist
+  because growth used to dead-end at 60 care points, after which the screen had
+  nothing left to offer; the anchor tests exist because accessory positions were
+  expressed as edge alignments that pushed hats outside the box, where no one
+  could fix them from the UI.
 - `TimeUtilsTest.kt` (4) — stable sortable day keys and signed day gaps.
 - `DailyCycleTest.kt` (8) — the day boundary: a yesterday check-in must not
   disable today's button, same-day records are collected and de-duplicated, day

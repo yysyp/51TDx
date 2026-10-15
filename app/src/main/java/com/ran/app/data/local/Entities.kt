@@ -169,6 +169,14 @@ data class PetEntity(
     val equippedFace: String = "",
     val equippedNeck: String = "",
     val equippedBack: String = "",
+    /**
+     * Per-accessory drag corrections, as `id:dx:dy` triples joined by commas.
+     *
+     * Keyed by accessory rather than by slot: emoji glyphs carry their own
+     * padding, so no shared slot anchor can line all of them up. See
+     * [PetEngine.OffsetStore] for why this is one CSV instead of many columns.
+     */
+    val offsetCsv: String = "",
     val createdAt: Long = System.currentTimeMillis()
 ) {
     companion object {

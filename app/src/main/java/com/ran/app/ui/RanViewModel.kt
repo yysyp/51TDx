@@ -356,6 +356,21 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
         if (clean.isNotBlank()) emit("以后就叫「$clean」啦")
     }
 
+    /** Commits a drag; called once per gesture end, not on every move. */
+    fun moveAccessory(id: String, dx: Float, dy: Float) = viewModelScope.launch {
+        repo.moveAccessoryOffset(id, dx, dy)
+    }
+
+    fun resetAccessory(id: String) = viewModelScope.launch {
+        repo.resetAccessoryOffset(id)
+        emit("装扮回到原来的位置啦")
+    }
+
+    fun resetAllAccessories() = viewModelScope.launch {
+        repo.resetAllAccessoryOffsets()
+        emit("所有装扮都摆正了")
+    }
+
     // ---------- Helpers ----------
 
     private fun computeStreakFrom(days: List<String>): Int {

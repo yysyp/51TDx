@@ -66,7 +66,10 @@ fun PetScreen(
     modifier: Modifier = Modifier,
     onAction: (PetEngine.Action) -> Unit,
     onBuy: (String) -> Unit,
-    onRename: (String) -> Unit
+    onRename: (String) -> Unit,
+    onMoveAccessory: (String, Float, Float) -> Unit,
+    onResetAccessory: (String) -> Unit,
+    onResetAllAccessories: () -> Unit
 ) {
     if (pet == null) {
         LazyColumn(modifier = modifier.fillMaxWidth()) {
@@ -79,9 +82,15 @@ fun PetScreen(
     val minutesAway = PetEngine.minutesSince(pet.lastActionAt, now)
     val expression = PetEngine.expression(pet.hunger, pet.mood, minutesAway, justAte = false)
     val stage = Stage.forCare(pet.careCount)
+    val level = PetEngine.Level.levelFor(pet.careCount)
     val owned = pet.ownedCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
     val equipped = setOf(pet.equippedHat, pet.equippedFace, pet.equippedNeck, pet.equippedBack)
         .filter { it.isNotBlank() }.toSet()
+    // Nothing to adjust until something is worn — offering an empty editing
+    // mode would just be a button that does nothing.
+    val canAdjust = equipped.isNotEmpty()
+    var adjusting by rememberSaveable { mutableStateOf(false) }
+    val isAdjusting = adjusting && canAdjust
 
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
@@ -96,23 +105,59 @@ fun PetScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "${pet.name} · ${stage.label}",
+                        text = "${pet.name} · ${stage.label} · Lv.$level",
                         style = MaterialTheme.typography.titleLarge
                     )
                     RenameChip(name = pet.name, onRename = onRename)
                 }
                 Spacer(Modifier.height(8.dp))
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    PetAvatar(pet = pet, expression = expression, boxSize = 168.dp)
+                    PetAvatar(
+                        pet = pet,
+                        expression = expression,
+                        boxSize = 168.dp,
+                        editable = isAdjusting,
+                        onMoveAccessory = { id, dx, dy -> onMoveAccessory(id, dx, dy) }
+                    )
                 }
-                Spacer(Modifier.height(10.dp))
-                SpeechBubble(text = PetEngine.lineFor(expression, pet.name))
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    if (isAdjusting) {
+                        TextButton(onClick = onResetAllAccessories) { Text("全部复位") }
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    if (canAdjust) {
+                        TextButton(onClick = { adjusting = !adjusting }) {
+                            Text(if (isAdjusting) "完成" else "摆正装扮")
+                        }
+                    }
+                }
+                if (isAdjusting) {
+                    AdjustHint(worn = PetEngine.CATALOG.filter { it.id in equipped })
+                    Spacer(Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PetEngine.CATALOG.filter { it.id in equipped }.forEach { accessory ->
+                            ResetChip(
+                                emoji = accessory.emoji,
+                                name = accessory.name,
+                                modifier = Modifier.weight(1f),
+                                onReset = { onResetAccessory(accessory.id) }
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                } else {
+                    SpeechBubble(text = PetEngine.lineFor(expression, pet.name))
+                }
                 Spacer(Modifier.height(12.dp))
                 NeedBar(label = "饱腹", value = pet.hunger, tint = Coral)
                 Spacer(Modifier.height(8.dp))
                 NeedBar(label = "心情", value = pet.mood, tint = Teal)
                 Spacer(Modifier.height(10.dp))
-                StageProgress(current = stage, care = pet.careCount)
+                LevelProgress(stage = stage, care = pet.careCount)
             }
         }
 
@@ -158,6 +203,7 @@ fun PetScreen(
                                     ShopTile(
                                         emoji = accessory.emoji,
                                         title = accessory.name,
+                                        rarity = accessory.rarity,
                                         price = accessory.price,
                                         owned = accessory.id in owned,
                                         equipped = accessory.id in equipped,
@@ -181,9 +227,14 @@ fun PetScreen(
                 SectionTitle(text = "小记", emoji = "📖", subtitle = "这些都是你照顾出来的")
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth()) {
+                    StatPill("等级", "Lv.${PetEngine.Level.levelFor(pet.careCount)}", Modifier.weight(1f))
                     StatPill("照顾次数", "${pet.careCount}", Modifier.weight(1f))
                     StatPill("当前阶段", stage.label, Modifier.weight(1f))
-                    StatPill("装扮拥有", "${owned.size}", Modifier.weight(1f))
+                    StatPill(
+                        "装扮拥有",
+                        "${owned.size}/${PetEngine.CATALOG.size}",
+                        Modifier.weight(1f)
+                    )
                 }
             }
         }
@@ -233,20 +284,24 @@ private fun NeedBar(label: String, value: Int, tint: Color) {
     }
 }
 
-/** Growth is shown against the next threshold so progress is visible, not binary. */
+/**
+ * Growth bar.
+ *
+ * The bar tracks *level*, not stage. Stages are the five milestones that change
+ * the drawing, but they eventually run out, and a bar pinned at 100% forever is
+ * worse than no bar at all: it is a daily reminder that nothing is left. Level
+ * has no ceiling, so there is always a next mark even for someone who has cared
+ * for hundreds of days.
+ */
 @Composable
-private fun StageProgress(current: Stage, care: Int) {
-    val next = Stage.values().firstOrNull { it.step == current.step + 1 }
-    val text = if (next == null) {
-        "已经是最终形态啦"
-    } else {
-        "再照顾 ${(next.minCare - care).coerceAtLeast(1)} 次就能变成${next.label}"
-    }
-    val ratio = if (next == null) 1f
-    else {
-        val span = (next.minCare - current.minCare).coerceAtLeast(1)
-        ((care - current.minCare).toFloat() / span).coerceIn(0f, 1f)
-    }
+private fun LevelProgress(stage: Stage, care: Int) {
+    val level = PetEngine.Level.levelFor(care)
+    val nextStage = Stage.next(stage)
+    val headline = "Lv.$level · 再照顾 ${PetEngine.Level.careToNextLevel(care)} 次升级"
+    val footnote = nextStage?.let { next ->
+        "再照顾 ${(next.minCare - care).coerceAtLeast(1)} 次进化为${next.label}"
+    } ?: "已经是最终形态，等级还可以一直涨"
+
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -254,20 +309,75 @@ private fun StageProgress(current: Stage, care: Int) {
         ) {
             Text(text = "成长", style = MaterialTheme.typography.labelMedium)
             Text(
-                text = text,
+                text = headline,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
         Spacer(Modifier.height(4.dp))
         LinearProgressIndicator(
-            progress = { ratio },
+            progress = { PetEngine.Level.progressInLevel(care) },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(6.dp)
                 .clip(RoundedCornerShape(999.dp)),
             color = Amber
         )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = footnote,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun AdjustHint(worn: List<PetEngine.Accessory>) {
+    if (worn.isEmpty()) return
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Amber.copy(alpha = 0.16f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(
+            text = "按住装扮拖到你觉得顺眼的位置，松手就记住啦",
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelSmall,
+            textAlign = TextAlign.Center,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+@Composable
+private fun ResetChip(
+    emoji: String,
+    name: String,
+    modifier: Modifier = Modifier,
+    onReset: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(onClick = onReset)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Text(text = emoji, fontSize = 18.sp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "复位",
+                style = MaterialTheme.typography.labelSmall,
+                color = Teal
+            )
+        }
     }
 }
 
@@ -309,6 +419,7 @@ private fun ActionRow(
 private fun ShopTile(
     emoji: String,
     title: String,
+    rarity: PetEngine.Rarity,
     price: Int,
     owned: Boolean,
     equipped: Boolean,
@@ -342,14 +453,25 @@ private fun ShopTile(
         )
         Spacer(Modifier.height(2.dp))
         Text(
-            text = when {
-                equipped -> "已戴上"
-                owned -> "点击戴上"
-                !affordable -> "$price ⭐"
-                else -> "$price ⭐"
+            text = buildString {
+                append(rarity.badge)
+                append(' ')
+                if (equipped) append("已戴上")
+                else if (owned) append("点击戴上")
+                else append("$price ⭐")
             },
             style = MaterialTheme.typography.labelSmall,
-            color = if (equipped) Teal else MaterialTheme.colorScheme.onSurfaceVariant
+            color = when {
+                equipped -> Teal
+                !owned -> when (rarity) {
+                    // Nothing being sold is hidden, but the expensive things are
+                    // lit up so there is something visible to save toward.
+                    PetEngine.Rarity.LEGEND -> Amber
+                    PetEngine.Rarity.RARE -> MaterialTheme.colorScheme.primary
+                    PetEngine.Rarity.COMMON -> MaterialTheme.colorScheme.onSurfaceVariant
+                }.let { if (affordable) it else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f) }
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            }
         )
     }
 }

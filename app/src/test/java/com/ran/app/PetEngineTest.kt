@@ -3,6 +3,7 @@ package com.ran.app
 import com.ran.app.core.PetEngine
 import com.ran.app.core.PetEngine.Action
 import com.ran.app.core.PetEngine.Expression
+import com.ran.app.core.PetEngine.Rarity
 import com.ran.app.core.PetEngine.Stage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -82,8 +83,7 @@ class PetEngineTest {
     }
 
     @Test
-    fun `a long absence reads as sleep rather than neglect`() {
-        assertEquals(
+    fun `a long absence reads as sleep rather than neglect`() {        assertEquals(
             Expression.SLEEPY,
             PetEngine.expression(hunger = 80, mood = 80, minutesSinceLastAction = PetEngine.SLEEP_AFTER_MINUTES, justAte = false)
         )
@@ -119,9 +119,55 @@ class PetEngineTest {
     fun `stages follow care count monotonically`() {
         assertEquals(Stage.EGG, Stage.forCare(0))
         assertEquals(Stage.BABY, Stage.forCare(1))
-        assertEquals(Stage.CHILD, Stage.forCare(20))
-        assertEquals(Stage.ADULT, Stage.forCare(60))
-        assertEquals(Stage.ADULT, Stage.forCare(10_000))
+        assertEquals(Stage.CHILD, Stage.forCare(30))
+        assertEquals(Stage.ADULT, Stage.forCare(90))
+        assertEquals(Stage.LEGEND, Stage.forCare(240))
+        assertEquals(Stage.LEGEND, Stage.forCare(10_000))
+    }
+
+    /**
+     * The regression that motivated the level axis: the old model topped out at
+     * 60 care points and afterwards the pet had nothing left to offer. Growth
+     * has to keep producing a next mark however long someone plays.
+     */
+    @Test
+    fun `levels never stop even after the last stage`() {
+        val afterLegend = 10_000
+        assertEquals(Stage.LEGEND, Stage.forCare(afterLegend))
+        assertTrue(PetEngine.Level.levelFor(afterLegend) > PetEngine.Level.levelFor(240))
+        assertTrue(PetEngine.Level.levelFor(afterLegend + 20) > PetEngine.Level.levelFor(afterLegend))
+    }
+
+    @Test
+    fun `level maths is self consistent`() {
+        assertEquals(1, PetEngine.Level.levelFor(0))
+        assertEquals(1, PetEngine.Level.levelFor(PetEngine.LEVEL_CARE_PER_LEVEL - 1))
+        assertEquals(2, PetEngine.Level.levelFor(PetEngine.LEVEL_CARE_PER_LEVEL))
+        assertEquals(PetEngine.LEVEL_CARE_PER_LEVEL, PetEngine.Level.totalCareForLevel(2))
+        // Negative can only arrive from corrupt data; it must not divide negative.
+        assertEquals(1, PetEngine.Level.levelFor(-5))
+
+        assertEquals(0f, PetEngine.Level.progressInLevel(0))
+        assertEquals(PetEngine.LEVEL_CARE_PER_LEVEL, PetEngine.Level.careToNextLevel(0))
+        assertEquals(19, PetEngine.Level.careToNextLevel(1))
+
+        // Every level boundary is reached exactly once per range.
+        for (care in 0 until PetEngine.LEVEL_CARE_PER_LEVEL * 4) {
+            val level = PetEngine.Level.levelFor(care)
+            assertTrue(
+                "care=$care reported level=$level",
+                care >= PetEngine.Level.totalCareForLevel(level) &&
+                    care < PetEngine.Level.totalCareForLevel(level + 1)
+            )
+        }
+    }
+
+    @Test
+    fun `there is always a cheap way to say hello on a poor day`() {
+        // A day with almost no earnings still has to be visitable, or the pet
+        // becomes a debt collector rather than a companion.
+        assertTrue(Action.all().minOf { it.cost } <= 5)
+        assertTrue("actions must span a real price range", Action.all().maxOf { it.cost } >= 10)
     }
 
     @Test
@@ -174,5 +220,83 @@ class PetEngineTest {
             assertTrue("round $round hunger bottomed out: $hunger", hunger > 20)
             assertTrue("round $round mood collapsed: $mood", mood >= 50)
         }
+    }
+
+    @Test
+    fun `every slot stocks a cheap first buy and something to save up for`() {
+        PetEngine.Slot.values().forEach { slot ->
+            val items = PetEngine.CATALOG.filter { it.slot == slot }
+            assertTrue("$slot stocks too little to choose between", items.size >= 4)
+            assertTrue("$slot has nothing a beginner can afford", items.any { it.price <= 30 })
+            assertTrue("$slot is dead content: nothing rare to aim at", items.any { it.rarity != Rarity.COMMON })
+        }
+    }
+
+    /**
+     * Guards the actual bug behind "the accessory is in the wrong place": the
+     * old anchors were expressed as edge alignments with extra offsets, which
+     * pushed several items outside the box where no amount of patience could
+     * line them up. Every default must sit fully inside the frame.
+     */
+    @Test
+    fun `every default anchor keeps its glyph inside the avatar box`() {
+        PetEngine.Slot.values().forEach { slot ->
+            val (x, y) = slot.anchor()
+            val reach = slot.glyphRatio() / 2f
+            assertTrue(
+                "$slot spills horizontally: x=$x reach=$reach",
+                kotlin.math.abs(x) + reach <= 0.5f
+            )
+            assertTrue(
+                "$slot spills vertically: y=$y reach=$reach",
+                kotlin.math.abs(y) + reach <= 0.5f
+            )
+        }
+    }
+
+    @Test
+    fun `nudges are remembered per accessory, not per slot`() {
+        val store = PetEngine.OffsetStore
+        var map = store.parse("")
+        assertTrue(map.isEmpty())
+
+        map = store.with(map, "crown", 0.12f, -0.08f)
+        map = store.with(map, "halo", -0.2f, 0.3f)
+
+        val reloaded = store.parse(store.serialize(map))
+        assertEquals(0.12f, store.offsetFor(reloaded, "crown").dx)
+        assertEquals(-0.08f, store.offsetFor(reloaded, "crown").dy)
+        // Aligning one item must leave its neighbour where it was.
+        assertEquals(0f, store.offsetFor(reloaded, "bow").dx)
+        assertEquals(-0.2f, store.offsetFor(reloaded, "halo").dx)
+    }
+
+    @Test
+    fun `resetting one accessory leaves the others aligned`() {
+        val store = PetEngine.OffsetStore
+        var map = store.parse("")
+        map = store.with(map, "crown", 0.1f, 0.1f)
+        map = store.with(map, "halo", 0.2f, 0.2f)
+        val afterReset = store.without(map, "crown")
+        assertEquals(0f, store.offsetFor(afterReset, "crown").dx)
+        assertEquals(0.2f, store.offsetFor(afterReset, "halo").dx)
+    }
+
+    @Test
+    fun `a wild fling cannot throw an accessory out of frame`() {
+        val store = PetEngine.OffsetStore
+        val wild = store.with(store.parse(""), "crown", 99f, -99f)
+        assertEquals(store.MAX, store.offsetFor(wild, "crown").dx)
+        assertEquals(-store.MAX, store.offsetFor(wild, "crown").dy)
+    }
+
+    @Test
+    fun `corrupt offset data is skipped instead of crashing`() {
+        val store = PetEngine.OffsetStore
+        val parsed = store.parse("crown:0.1,halo:bad:0.2,bow:0.1:0.2")
+        assertEquals(0f, store.offsetFor(parsed, "crown").dx)
+        assertEquals(0f, store.offsetFor(parsed, "halo").dy)
+        assertEquals(0.1f, store.offsetFor(parsed, "bow").dx)
+        assertTrue(store.parse("").isEmpty())
     }
 }

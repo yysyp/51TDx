@@ -51,17 +51,66 @@ object PetEngine {
     const val SLEEP_AFTER_MINUTES = 12 * 60
 
     // ---------- Growth ----------
+    //
+    // Growth runs on two axes deliberately.
+    //
+    // Stage is the *shape*: five visible milestones that change how the pet
+    // looks, because nothing sells the first step like seeing something change.
+    // Level is the *number*: it never stops.
+    //
+    // The second axis exists because of what "finished" does to a habit loop.
+    // Originally the pet topped out at 60 care points — roughly 300 stars, two
+    // or three weeks — and after that the screen had nothing left to say.
+    // A completed toy does not retain attention; the day there is no next step
+    // is the day the feature stops being a reason to open the app. Making the
+    // level unbounded costs one line of arithmetic and removes that cliff.
 
-    /** Growth is driven by care actions, never by stars paid directly. */
+    /**
+     * Growth is driven by care actions, never by stars paid directly.
+     *
+     * Thresholds are spaced by roughly a month of comfortable caring rather
+     * than evenly: the first milestone must arrive within days to establish
+     * that caring does something, and the later ones may take weeks because by
+     * then the pet itself is the reward.
+     */
     enum class Stage(val step: Int, val label: String, val minCare: Int) {
         EGG(0, "蛋", 0),
         BABY(1, "幼崽", 1),
-        CHILD(2, "小伙伴", 20),
-        ADULT(3, "守护兽", 60);
+        CHILD(2, "小伙伴", 30),
+        ADULT(3, "守护兽", 90),
+        LEGEND(4, "星辰伙伴", 240);
 
         companion object {
             fun forCare(care: Int): Stage = entries.lastOrNull { care >= it.minCare } ?: EGG
+
+            /** The next milestone, or null once every stage has been reached. */
+            fun next(current: Stage): Stage? = entries.firstOrNull { it.step == current.step + 1 }
         }
+    }
+
+    /**
+     * Care points per level.
+     *
+     * Fixed rather than escalating so the user can always tell how much effort
+     * one more level costs — an accelerating curve hides its own price, and a
+     * hidden price reads as the game moving the goalposts.
+     */
+    const val LEVEL_CARE_PER_LEVEL = 20
+
+    /** Always has a next level, which is the entire point of having levels. */
+    object Level {
+        fun levelFor(care: Int): Int = care.coerceAtLeast(0) / LEVEL_CARE_PER_LEVEL + 1
+
+        /** Care accumulated inside the current level, for the progress bar. */
+        fun careIntoLevel(care: Int): Int = care.coerceAtLeast(0) % LEVEL_CARE_PER_LEVEL
+
+        fun progressInLevel(care: Int): Float =
+            careIntoLevel(care).toFloat() / LEVEL_CARE_PER_LEVEL.toFloat()
+
+        fun careToNextLevel(care: Int): Int = LEVEL_CARE_PER_LEVEL - careIntoLevel(care)
+
+        /** Total care needed to *reach* [level]. */
+        fun totalCareForLevel(level: Int): Int = LEVEL_CARE_PER_LEVEL * (level - 1)
     }
 
     /** Species are cosmetic only; every stat behaves identically. */
@@ -136,6 +185,19 @@ object PetEngine {
 
     // ---------- Care actions ----------
 
+    /**
+     * Care actions — the daily places stars go.
+     *
+     * The spread matters more than any single price. Two cheaps crawls of the
+     * cheapest actions exist deliberately (a sip of water, a tidy-up): on a day
+     * when the user earned almost nothing and feels poor, there must still be
+     * something they can do, because a pet you cannot afford to greet is a pet
+     * you stop visiting. At the top end a full meal is expensive enough that
+     * paying for it feels like spending real earnings.
+     *
+     * Everything costs stars. That is not incidental — without a sink, stars
+     * inflate and the rewards that mint them stop meaning anything.
+     */
     enum class Action(
         val emoji: String,
         val label: String,
@@ -144,10 +206,12 @@ object PetEngine {
         val moodDelta: Int,
         val carePoints: Int
     ) {
+        DRINK("🥛", "喂口水", 3, 4, 6, 1),
         SNACK("🍪", "小零食", 5, 12, 4, 1),
         MEAL("🍚", "正餐", 12, 32, 10, 2),
         DESSERT("🍰", "小蛋糕", 8, 8, 22, 1),
         PLAY("🎾", "陪它玩", 10, -10, 25, 3),
+        CLEAN("🧹", "打扫小窝", 4, 0, 14, 1),
         GROOM("🧴", "梳毛洗澡", 6, 0, 14, 1);
 
         companion object {
@@ -157,14 +221,62 @@ object PetEngine {
 
     // ---------- Accessories ----------
 
-    enum class Slot(val label: String) { HAT("头顶"), FACE("脸上"), NECK("脖子"), BACK("身后") }
+    enum class Slot(val label: String) {
+        HAT("头顶"),
+        FACE("脸上"),
+        NECK("脖子"),
+        BACK("身后");
+
+        /**
+         * Default anchor as a fraction of the avatar box; (0,0) is the centre
+         * and +y is down.
+         *
+         * These replaced a set of alignment-plus-offset rules that pushed some
+         * accessories *outside* the box — a hat anchored to the top edge and
+         * then nudged further up gets clipped, which is exactly "the hat is in
+         * the wrong place" and no amount of patience can fix it from the UI.
+         * Working from the centre keeps every anchor inside the frame.
+         */
+        fun anchor(): Pair<Float, Float> = when (this) {
+            HAT -> 0f to -0.28f
+            FACE -> 0f to 0.07f
+            NECK -> 0f to 0.27f
+            BACK -> -0.33f to 0.04f
+        }
+
+        /** Size of the drawn emoji, as a fraction of the avatar box. */
+        fun glyphRatio(): Float = when (this) {
+            HAT -> 0.34f
+            FACE -> 0.30f
+            NECK -> 0.26f
+            BACK -> 0.24f
+        }
+
+        /** Drawn once per side, mirrored across the vertical axis. */
+        fun mirrored(): Boolean = this == BACK
+    }
+
+    /**
+     * Scarcity is cosmetic: three price bands, no difference in behaviour.
+     *
+     * It exists because a flat catalogue has no shape — with everything costing
+     * roughly the same there is nothing to save up *for*, and saving toward a
+     * specific legendary item sustains activity far longer than twelve equal
+     * purchases would.
+     */
+    enum class Rarity(val label: String, val badge: String) {
+        COMMON("常见", "·"),
+        RARE("稀有", "✦"),
+        LEGEND("传说", "★")
+    }
 
     data class Accessory(
         val id: String,
         val name: String,
         val emoji: String,
         val price: Int,
-        val slot: Slot
+        val slot: Slot,
+        val rarity: Rarity = Rarity.COMMON
     )
 
     /**
@@ -173,23 +285,97 @@ object PetEngine {
      * earned; pricier and the shop becomes a wall. Buying is the sink that gives
      * stars their value — without something to spend them on, rewards inflate
      * and stop motivating.
+     *
+     * Twenty-four items rather than twelve for a specific reason: collecting is
+     * the one kind of content that cannot be "finished" in a bad way. Growth
+     * milestones eventually run out, so each doubles as a reason to keep going,
+     * and fully decking out a pet is a project measured in months.
      */
     val CATALOG: List<Accessory> = listOf(
-        Accessory("beanie", "毛线帽", "🧢", 18, Slot.HAT),
-        Accessory("bow", "蝴蝶结", "🎀", 15, Slot.HAT),
-        Accessory("crown", "小王冠", "👑", 60, Slot.HAT),
-        Accessory("wizard", "巫师帽", "🧙", 48, Slot.HAT),
-        Accessory("glasses", "小眼镜", "👓", 22, Slot.FACE),
-        Accessory("sunglasses", "墨镜", "🕶️", 30, Slot.FACE),
-        Accessory("mask", "小口罩", "😷", 20, Slot.FACE),
-        Accessory("scarf", "围巾", "🧣", 26, Slot.NECK),
-        Accessory("tie", "领结", "🎗️", 24, Slot.NECK),
-        Accessory("medal", "奖牌", "🏅", 45, Slot.NECK),
-        Accessory("wings", "翅膀", "🪽", 70, Slot.BACK),
-        Accessory("flower", "小花", "🌸", 16, Slot.BACK)
+        // Head
+        Accessory("beanie", "毛线帽", "🧢", 18, Slot.HAT, Rarity.COMMON),
+        Accessory("bow", "蝴蝶结", "🎀", 15, Slot.HAT, Rarity.COMMON),
+        Accessory("straw", "小草帽", "👒", 26, Slot.HAT, Rarity.COMMON),
+        Accessory("wizard", "巫师帽", "🧙", 48, Slot.HAT, Rarity.RARE),
+        Accessory("crown", "小王冠", "👑", 60, Slot.HAT, Rarity.LEGEND),
+        Accessory("halo", "小光环", "😇", 72, Slot.HAT, Rarity.LEGEND),
+
+        // Face
+        Accessory("glasses", "小眼镜", "👓", 22, Slot.FACE, Rarity.COMMON),
+        Accessory("sunglasses", "墨镜", "🕶️", 30, Slot.FACE, Rarity.COMMON),
+        Accessory("mask", "小口罩", "😷", 20, Slot.FACE, Rarity.COMMON),
+        Accessory("nose", "小丑鼻", "🤡", 24, Slot.FACE, Rarity.COMMON),
+        Accessory("spyglass", "侦探镜", "🔍", 32, Slot.FACE, Rarity.RARE),
+        Accessory("goggles", "小泳镜", "🥽", 36, Slot.FACE, Rarity.RARE),
+
+        // Neck
+        Accessory("tie", "领结", "🎗️", 24, Slot.NECK, Rarity.COMMON),
+        Accessory("scarf", "围巾", "🧣", 26, Slot.NECK, Rarity.COMMON),
+        Accessory("bell", "小铃铛", "🔔", 28, Slot.NECK, Rarity.COMMON),
+        Accessory("medal", "奖牌", "🏅", 45, Slot.NECK, Rarity.RARE),
+        Accessory("beads", "小项链", "📿", 50, Slot.NECK, Rarity.RARE),
+        Accessory("cape", "小披风", "🧥", 66, Slot.NECK, Rarity.LEGEND),
+
+        // Behind
+        Accessory("flower", "小花", "🌸", 16, Slot.BACK, Rarity.COMMON),
+        Accessory("balloon", "气球", "🎈", 20, Slot.BACK, Rarity.COMMON),
+        Accessory("leaf", "小绿叶", "🍃", 22, Slot.BACK, Rarity.COMMON),
+        Accessory("cloud", "云朵", "☁️", 28, Slot.BACK, Rarity.COMMON),
+        Accessory("rocket", "小火箭", "🚀", 55, Slot.BACK, Rarity.RARE),
+        Accessory("wings", "翅膀", "🪽", 70, Slot.BACK, Rarity.LEGEND)
     )
 
-    fun accessoryOf(id: String?): Accessory? = CATALOG.firstOrNull { it.id == id }
+    fun accessoryOf(id: String?): Accessory? = id?.let { wanted -> CATALOG.firstOrNull { it.id == wanted } }
+
+    /**
+     * A user-made position correction for one specific accessory, in fractions
+     * of the avatar box. Stored relative to the slot's anchor, so changing a
+     * default anchor later never invalidates anyone's adjustment.
+     */
+    data class Nudge(val dx: Float = 0f, val dy: Float = 0f)
+
+    /**
+     * Nudges are remembered *per accessory*, not per slot.
+     *
+     * That distinction is the whole feature: every emoji ships with its own
+     * internal padding and baseline, so no single anchor can align a top hat and
+     * a halo at once. A per-slot fix just moves which one looks wrong.
+     *
+     * Serialised into one CSV column rather than spread across fields — it is a
+     * sparse map that is always read and written together with the pet row, and
+     * one column keeps future changes out of the migration path.
+     */
+    object OffsetStore {
+        /** Cap so a stray fling can never throw a hat out of frame. */
+        const val MAX = 0.5f
+
+        fun parse(csv: String): Map<String, Nudge> {
+            if (csv.isBlank()) return emptyMap()
+            return csv.split(',').mapNotNull { token ->
+                val parts = token.split(':')
+                if (parts.size != 3) return@mapNotNull null
+                val dx = parts[1].toFloatOrNull() ?: return@mapNotNull null
+                val dy = parts[2].toFloatOrNull() ?: return@mapNotNull null
+                parts[0] to Nudge(dx.coerceIn(-MAX, MAX), dy.coerceIn(-MAX, MAX))
+            }.toMap()
+        }
+
+        fun serialize(map: Map<String, Nudge>): String =
+            map.entries.joinToString(",") { (id, nudge) -> "$id:${round(nudge.dx)}:${round(nudge.dy)}" }
+
+        fun with(map: Map<String, Nudge>, id: String, dx: Float, dy: Float): Map<String, Nudge> =
+            map + (id to Nudge(dx.coerceIn(-MAX, MAX), dy.coerceIn(-MAX, MAX)))
+
+        fun without(map: Map<String, Nudge>, id: String): Map<String, Nudge> = map - id
+
+        fun offsetFor(map: Map<String, Nudge>, id: String): Nudge = map[id] ?: Nudge()
+
+        /** Applies a stored nudge to its slot anchor, clamped to the frame. */
+        fun combined(base: Pair<Float, Float>, nudge: Nudge): Pair<Float, Float> =
+            (base.first + nudge.dx).coerceIn(-1f, 1f) to (base.second + nudge.dy).coerceIn(-1f, 1f)
+
+        private fun round(value: Float): Float = kotlin.math.round(value * 1000f) / 1000f
+    }
 
     // ---------- Pure state helpers ----------
 

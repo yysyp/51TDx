@@ -1,12 +1,18 @@
 package com.ran.app.ui.components
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -14,7 +20,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import com.ran.app.core.PetEngine
@@ -23,6 +32,7 @@ import com.ran.app.core.PetEngine.Slot
 import com.ran.app.core.PetEngine.Species
 import com.ran.app.core.PetEngine.Stage
 import com.ran.app.data.local.PetEntity
+import kotlin.math.roundToInt
 
 /**
  * Draws the companion.
@@ -35,6 +45,12 @@ import com.ran.app.data.local.PetEntity
  *
  * Everything scales from the passed [boxSize], so the same component works as a
  * compact shop thumbnail and as the full-width hero.
+ *
+ * In [editable] mode each worn accessory becomes draggable. That exists because
+ * emoji glyphs are not interchangeable rectangles: each ships with its own
+ * padding and baseline, so no single anchor suits them all and someone always
+ * finds one sitting visibly off. Rather than guess a third time, the user sets
+ * it — they can see the screen and we cannot.
  */
 @Composable
 fun PetAvatar(
@@ -42,12 +58,18 @@ fun PetAvatar(
     expression: Expression,
     boxSize: Dp,
     modifier: Modifier = Modifier,
+    editable: Boolean = false,
+    onMoveAccessory: ((id: String, dx: Float, dy: Float) -> Unit)? = null,
     tint: Color = MaterialTheme.colorScheme.onSurface
 ) {
     val species = Species.of(pet.species)
     val stage = Stage.forCare(pet.careCount)
     val body = colorFor(species, dark = false)
     val inner = colorFor(species, dark = true)
+
+    val nudges = remember(pet.offsetCsv) { PetEngine.OffsetStore.parse(pet.offsetCsv) }
+    val density = LocalDensity.current
+    val boxPx = remember(density, boxSize) { with(density) { boxSize.toPx() } }
 
     Box(modifier = modifier.size(boxSize), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.size(boxSize)) {
@@ -98,29 +120,38 @@ fun PetAvatar(
             drawBlush(expression, w, h)
         }
 
-        // Accessory overlays. Each slot has a fixed anchor so swapping never
-        // shifts the others around.
-        pet.equippedBack.takeIf { it.isNotBlank() }?.let { id ->
-            PetEngine.accessoryOf(id)?.let { acc ->
-                Glyph(acc.emoji, boxSize, 0.26f, Modifier.align(Alignment.TopStart).offset(x = boxSize * 0.02f, y = boxSize * 0.06f))
-                Glyph(acc.emoji, boxSize, 0.26f, Modifier.align(Alignment.TopEnd).offset(x = boxSize * -0.02f, y = boxSize * 0.06f))
+        // Accessory overlays, anchored from the centre of the box so the default
+        // position can never fall outside it, plus whatever correction the user
+        // has dragged onto that particular item.
+        wornAccessories(pet).forEach { worn ->
+            val anchor = worn.slot.anchor()
+            val nudge = PetEngine.OffsetStore.offsetFor(nudges, worn.id)
+            // BACK draws once per side; both copies move together so the pair
+            // still reads as a pair after being nudged.
+            val sides = if (worn.slot.mirrored()) listOf(1f, -1f) else listOf(1f)
+
+            sides.forEach { sign ->
+                val baseXPx = (anchor.first * sign + nudge.dx).coerceIn(-1f, 1f) * boxPx
+                val baseYPx = (anchor.second + nudge.dy).coerceIn(-1f, 1f) * boxPx
+                DraggableGlyph(
+                    emoji = worn.emoji,
+                    ratio = worn.slot.glyphRatio(),
+                    boxSize = boxSize,
+                    baseXPx = baseXPx,
+                    baseYPx = baseYPx,
+                    editable = editable,
+                    stateKey = worn.id to sign,
+                    onCommit = { deltaXPx, deltaYPx ->
+                        onMoveAccessory?.invoke(
+                            worn.id,
+                            nudge.dx + deltaXPx / boxPx,
+                            nudge.dy + deltaYPx / boxPx
+                        )
+                    }
+                )
             }
         }
-        pet.equippedHat.takeIf { it.isNotBlank() }?.let { id ->
-            PetEngine.accessoryOf(id)?.let { acc ->
-                Glyph(acc.emoji, boxSize, 0.34f, Modifier.align(Alignment.TopCenter).offset(y = boxSize * -0.06f))
-            }
-        }
-        pet.equippedFace.takeIf { it.isNotBlank() }?.let { id ->
-            PetEngine.accessoryOf(id)?.let { acc ->
-                Glyph(acc.emoji, boxSize, 0.30f, Modifier.align(Alignment.Center).offset(y = boxSize * -0.04f))
-            }
-        }
-        pet.equippedNeck.takeIf { it.isNotBlank() }?.let { id ->
-            PetEngine.accessoryOf(id)?.let { acc ->
-                Glyph(acc.emoji, boxSize, 0.28f, Modifier.align(Alignment.BottomCenter).offset(y = boxSize * -0.14f))
-            }
-        }
+
         if (expression == Expression.SLEEPY) {
             Text(
                 text = "💤",
@@ -131,9 +162,60 @@ fun PetAvatar(
     }
 }
 
+/**
+ * One accessory glyph, optionally draggable.
+ *
+ * The in-flight gesture lives in local pixel state and is written out only when
+ * the finger lifts — otherwise a drag issues dozens of database writes per
+ * second, each one restarting the very flows this avatar is drawn from.
+ */
 @Composable
-private fun Glyph(emoji: String, boxSize: Dp, ratio: Float, modifier: Modifier) {
-    Text(text = emoji, fontSize = emojiSize(boxSize, ratio), modifier = modifier)
+private fun DraggableGlyph(
+    emoji: String,
+    ratio: Float,
+    boxSize: Dp,
+    baseXPx: Float,
+    baseYPx: Float,
+    editable: Boolean,
+    stateKey: Any,
+    onCommit: (deltaXPx: Float, deltaYPx: Float) -> Unit
+) {
+    var dragPx by remember(stateKey) { mutableStateOf(Offset.Zero) }
+
+    // Once the persisted offset catches up, the local overlay must clear —
+    // otherwise every new drag adds itself on top of the one already applied.
+    LaunchedEffect(stateKey, baseXPx, baseYPx) { dragPx = Offset.Zero }
+
+    Text(
+        text = emoji,
+        fontSize = emojiSize(boxSize, ratio),
+        modifier = Modifier
+            .offset { IntOffset((baseXPx + dragPx.x).roundToInt(), (baseYPx + dragPx.y).roundToInt()) }
+            .then(
+                if (editable) {
+                    Modifier.pointerInput(stateKey) {
+                        detectDragGestures(
+                            onDragEnd = { onCommit(dragPx.x, dragPx.y) },
+                            onDragCancel = { dragPx = Offset.Zero }
+                        ) { _, dragAmount -> dragPx += dragAmount }
+                    }
+                } else {
+                    Modifier
+                }
+            )
+    )
+}
+
+/** Equipped items in draw order: behind the body first, face last. */
+private fun wornAccessories(pet: PetEntity): List<Worn> = buildList {
+    pet.equippedBack.takeIf { it.isNotBlank() }?.let { add(Worn(it, Slot.BACK)) }
+    pet.equippedNeck.takeIf { it.isNotBlank() }?.let { add(Worn(it, Slot.NECK)) }
+    pet.equippedHat.takeIf { it.isNotBlank() }?.let { add(Worn(it, Slot.HAT)) }
+    pet.equippedFace.takeIf { it.isNotBlank() }?.let { add(Worn(it, Slot.FACE)) }
+}.filter { it.emoji.isNotEmpty() }
+
+private class Worn(val id: String, val slot: Slot) {
+    val emoji: String get() = PetEngine.accessoryOf(id)?.emoji.orEmpty()
 }
 
 private fun emojiSize(boxSize: Dp, ratio: Float): TextUnit = (boxSize.value * ratio).sp

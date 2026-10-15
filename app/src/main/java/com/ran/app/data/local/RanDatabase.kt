@@ -28,7 +28,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     // schedule; they simply begin adapting from the next review.
     // v5 adds the virtual pet. Existing stars are untouched, so upgrading users
     // can immediately feed a pet with the balance they already earned.
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class RanDatabase : RoomDatabase() {
@@ -146,13 +146,23 @@ abstract class RanDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Default '' matches the entity default, so existing pets keep
+                // their catalogue anchors and lose no equipped item.
+                db.execSQL(
+                    "ALTER TABLE `pet` ADD COLUMN `offsetCsv` TEXT NOT NULL DEFAULT ''"
+                )
+            }
+        }
+
         fun get(context: Context): RanDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 RanDatabase::class.java,
                 "ran.db"
             )
-                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .fallbackToDestructiveMigration()
                 .build()
                 .also { instance = it }

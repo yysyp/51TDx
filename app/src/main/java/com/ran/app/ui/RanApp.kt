@@ -177,7 +177,10 @@ fun RanApp() {
                     stars = stats.stars,
                     onAction = vm::petAction,
                     onBuy = vm::buyAccessory,
-                    onRename = vm::renamePet
+                    onRename = vm::renamePet,
+                    onMoveAccessory = vm::moveAccessory,
+                    onResetAccessory = vm::resetAccessory,
+                    onResetAllAccessories = vm::resetAllAccessories
                 )
                 RanTab.FOOD -> FoodScreen(
                     foods = foods,

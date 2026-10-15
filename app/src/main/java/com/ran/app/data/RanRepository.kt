@@ -475,6 +475,32 @@ class RanRepository(
         petDao.upsert(row.copy(name = name))
     }
 
+    /**
+     * Remembers where the user dragged one accessory to.
+     *
+     * The offsets are theirs, not ours: glyph padding differs per emoji, so the
+     * person looking at the screen is the only one who can judge "straight".
+     */
+    suspend fun moveAccessoryOffset(id: String, dx: Float, dy: Float) {
+        val row = petDao.once() ?: return
+        val map = PetEngine.OffsetStore.with(PetEngine.OffsetStore.parse(row.offsetCsv), id, dx, dy)
+        petDao.upsert(row.copy(offsetCsv = PetEngine.OffsetStore.serialize(map)))
+    }
+
+    /** Drops one accessory back to its default anchor. */
+    suspend fun resetAccessoryOffset(id: String) {
+        val row = petDao.once() ?: return
+        val map = PetEngine.OffsetStore.without(PetEngine.OffsetStore.parse(row.offsetCsv), id)
+        petDao.upsert(row.copy(offsetCsv = PetEngine.OffsetStore.serialize(map)))
+    }
+
+    /** Clears every correction at once, for when a pet has been nudged into chaos. */
+    suspend fun resetAllAccessoryOffsets() {
+        val row = petDao.once() ?: return
+        if (row.offsetCsv.isBlank()) return
+        petDao.upsert(row.copy(offsetCsv = ""))
+    }
+
     private fun ownedSet(csv: String): Set<String> =
         csv.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
