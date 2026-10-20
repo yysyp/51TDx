@@ -23,7 +23,7 @@ class RewardEngineTest {
 
     @Test
     fun `weightedPick returns null on empty pool`() {
-        assertNull(RewardEngine.weightedPick(emptyList<String>(), { 1 }))
+        assertNull(RewardEngine.weightedPick(emptyList<String>(), { 1.0 }))
     }
 
     @Test
@@ -31,7 +31,7 @@ class RewardEngineTest {
         // Weights are coerced to at least 1, so a bad value must not throw or starve an item.
         val weights = mapOf("a" to 0, "b" to -5)
         repeat(200) {
-            val picked = RewardEngine.weightedPick(listOf("a", "b"), { weights.getValue(it) })
+            val picked = RewardEngine.weightedPick(listOf("a", "b"), { weights.getValue(it).toDouble() })
             assertNotNull(picked)
         }
     }
@@ -42,7 +42,7 @@ class RewardEngineTest {
         var rare = 0
         val random = Random(20260911)
         repeat(4000) {
-            if (RewardEngine.weightedPick(items, { if (it == "rare") 1 else 20 }, random) == "rare") rare++
+            if (RewardEngine.weightedPick(items, { if (it == "rare") 1.0 else 20.0 }, random) == "rare") rare++
         }
         // Expected share is 1/21 ~= 4.8%. A wide band keeps this stable yet meaningful.
         assertTrue("rare was drawn $rare/4000 times", rare in 40..320)
@@ -52,7 +52,7 @@ class RewardEngineTest {
     fun `weightedPick always returns an item from the pool`() {
         val items = (1..20).map { "item$it" }
         repeat(500) {
-            val picked = RewardEngine.weightedPick(items, { 1 })
+            val picked = RewardEngine.weightedPick(items, { 1.0 })
             assertTrue(picked in items)
         }
     }
@@ -60,7 +60,7 @@ class RewardEngineTest {
     @Test
     fun `weightedPick falls back to random when total weight is zero`() {
         val items = listOf("only")
-        assertEquals("only", RewardEngine.weightedPick(items, { 0 }))
+        assertEquals("only", RewardEngine.weightedPick(items, { 0.0 }))
     }
 
     // ---------- Progress and easing ----------
@@ -178,8 +178,99 @@ class RewardEngineTest {
         // loop stops functioning.
         val fromCheckIns = RewardEngine.STAR_CHECK_IN * 3
         assertTrue(fromCheckIns >= 5)
-        assertTrue(RewardEngine.STAR_PLAN_COMPLETE > RewardEngine.STAR_CHECK_IN)
-        assertTrue(RewardEngine.STAR_TODO_DONE > RewardEngine.STAR_CHECK_IN)
+        assertTrue(RewardEngine.DEFAULT_TODO_REWARD > RewardEngine.STAR_CHECK_IN)
+    }
+
+    @Test
+    fun `a todo reward can never exceed the cap`() {
+        assertEquals(RewardEngine.MAX_TODO_REWARD, RewardEngine.clampTodoReward(9999))
+        assertEquals(RewardEngine.MAX_TODO_REWARD, RewardEngine.clampTodoReward(500))
+        assertEquals(RewardEngine.MAX_TODO_REWARD, RewardEngine.clampTodoReward(11))
+        // The boundary itself is allowed.
+        assertEquals(RewardEngine.MAX_TODO_REWARD, RewardEngine.clampTodoReward(10))
+    }
+
+    @Test
+    fun `a user-authored reward never goes negative`() {
+        assertEquals(0, RewardEngine.clampTodoReward(-50))
+        assertEquals(0, RewardEngine.clampTodoReward(0))
+        assertEquals(3, RewardEngine.clampTodoReward(3))
+    }
+
+    @Test
+    fun `an unusable reward falls back to a sane default`() {
+        assertEquals(RewardEngine.DEFAULT_TODO_REWARD, RewardEngine.clampTodoReward(null))
+    }
+
+    @Test
+    fun `the cap holds for rows written before it existed`() {
+        // Regression: a todo saved when the editor allowed 9999 must not pay
+        // 9999 on completion. The grant path clamps, so the stored value is
+        // irrelevant to what actually gets paid.
+        val legacyRow = 9999
+        val granted = RewardEngine.clampTodoReward(legacyRow)
+        assertTrue("legacy row paid $granted", granted <= RewardEngine.MAX_TODO_REWARD)
+        // Reopening must refund exactly what was granted, never more.
+        assertEquals(granted, RewardEngine.clampTodoReward(legacyRow))
+    }
+
+    @Test
+    fun `plan reward defaults to three stars per target step`() {
+        assertEquals(3, RewardEngine.defaultPlanReward(1))
+        assertEquals(30, RewardEngine.defaultPlanReward(10))
+        assertEquals(63, RewardEngine.defaultPlanReward(21))
+        // A blank or nonsensical target must still produce a usable reward.
+        assertEquals(3, RewardEngine.defaultPlanReward(0))
+        assertEquals(3, RewardEngine.defaultPlanReward(-5))
+    }
+
+    @Test
+    fun `plan reward is capped at five stars per target step`() {
+        assertEquals(5, RewardEngine.maxPlanReward(1))
+        assertEquals(50, RewardEngine.maxPlanReward(10))
+        assertEquals(150, RewardEngine.maxPlanReward(30))
+        assertEquals(5, RewardEngine.maxPlanReward(0))
+    }
+
+    @Test
+    fun `a plan reward above the scaled cap is clamped down`() {
+        // 10 steps -> cap 50, so 9999 becomes 50, not the flat 10 of the old rule.
+        assertEquals(50, RewardEngine.clampPlanReward(9999, targetCount = 10))
+        assertEquals(50, RewardEngine.clampPlanReward(51, targetCount = 10))
+        assertEquals(50, RewardEngine.clampPlanReward(50, targetCount = 10))
+        // A short plan stays short: 2 steps -> cap 10.
+        assertEquals(10, RewardEngine.clampPlanReward(9999, targetCount = 2))
+    }
+
+    @Test
+    fun `an omitted plan reward becomes the per-step default`() {
+        assertEquals(30, RewardEngine.clampPlanReward(null, targetCount = 10))
+        assertEquals(3, RewardEngine.clampPlanReward(null, targetCount = 1))
+        assertEquals(0, RewardEngine.clampPlanReward(-1, targetCount = 10))
+    }
+
+    @Test
+    fun `plan reward always scales with the target and never inverts`() {
+        // A flat ceiling would make a 2-step plan worth more than a 30-step plan.
+        var previousMax = 0
+        for (target in 1..40) {
+            val max = RewardEngine.maxPlanReward(target)
+            assertTrue("max not increasing at target=$target", max > previousMax)
+            previousMax = max
+            assertTrue(
+                "default exceeds max at target=$target",
+                RewardEngine.defaultPlanReward(target) <= max
+            )
+            // The default is exactly three per step, which is the product rule.
+            assertEquals(target * 3, RewardEngine.defaultPlanReward(target))
+        }
+    }
+
+    @Test
+    fun `defaults themselves respect their own caps`() {
+        assertTrue(RewardEngine.DEFAULT_TODO_REWARD <= RewardEngine.MAX_TODO_REWARD)
+        assertTrue(RewardEngine.STAR_CHECK_IN <= RewardEngine.MAX_STAR_PER_CHECK_IN)
+        assertTrue(RewardEngine.MAX_STAR_PER_CHECK_IN <= RewardEngine.STAR_CHECK_IN * 2)
     }
 }
 

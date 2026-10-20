@@ -45,6 +45,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.ran.app.core.RewardEngine
 import com.ran.app.core.TimeUtils
 import com.ran.app.data.local.PlanEntity
 import com.ran.app.data.local.PlanStatus
@@ -238,7 +239,7 @@ private fun PlanCard(
                             .padding(horizontal = 9.dp, vertical = 4.dp)
                     ) {
                         Text(
-                            text = "完成 +${plan.starReward}⭐",
+                            text = "完成 +${RewardEngine.clampPlanReward(plan.starReward, plan.targetCount)}⭐",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color(0xFF8A6B00)
@@ -286,7 +287,7 @@ private fun CompletedPlanRow(plan: PlanEntity) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                text = "${plan.currentCount} 次 · +${plan.starReward}⭐",
+                text = "${plan.currentCount} 次 · +${RewardEngine.clampPlanReward(plan.starReward, plan.targetCount)}⭐",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -310,8 +311,22 @@ private fun PlanEditDialog(
     var title by rememberSaveable { mutableStateOf(plan?.title ?: "") }
     var note by rememberSaveable { mutableStateOf(plan?.note ?: "") }
     var emoji by rememberSaveable { mutableStateOf(plan?.emoji ?: "🎯") }
-    var target by rememberSaveable { mutableStateOf((plan?.targetCount ?: 21).toString()) }
-    var reward by rememberSaveable { mutableStateOf((plan?.starReward ?: 20).toString()) }
+    var target by rememberSaveable { mutableStateOf((plan?.targetCount ?: RewardEngine.DEFAULT_PLAN_TARGET).toString()) }
+    // The completion reward tracks the target count (3 stars per step by default,
+    // 5 per step at most). `rewardTouched` stops a manual override from being
+    // silently overwritten when the user then edits the target — but until they do
+    // touch it, the default follows the target so the two never contradict.
+    var rewardTouched by rememberSaveable { mutableStateOf(false) }
+    val targetInt = target.toIntOrNull()?.coerceAtLeast(1) ?: RewardEngine.DEFAULT_PLAN_TARGET
+    val suggestedReward = RewardEngine.defaultPlanReward(targetInt)
+    val maxReward = RewardEngine.maxPlanReward(targetInt)
+    val rewardDigits = maxReward.toString().length
+    var reward by rememberSaveable {
+        mutableStateOf(
+            RewardEngine.clampPlanReward(plan?.starReward, plan?.targetCount ?: RewardEngine.DEFAULT_PLAN_TARGET)
+                .toString()
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -345,15 +360,33 @@ private fun PlanEditDialog(
                 Row {
                     OutlinedTextField(
                         value = target,
-                        onValueChange = { input -> target = input.filter { it.isDigit() }.take(4) },
+                        onValueChange = { input ->
+                            val next = input.filter { it.isDigit() }.take(4)
+                            target = next
+                            if (!rewardTouched) {
+                                // Recomputed from the incoming text, not from
+                                // suggestedReward: that binding still holds the
+                                // pre-edit target for this composition.
+                                val nextTarget = next.toIntOrNull()?.coerceAtLeast(1)
+                                    ?: RewardEngine.DEFAULT_PLAN_TARGET
+                                reward = RewardEngine.defaultPlanReward(nextTarget).toString()
+                            }
+                        },
                         label = { Text("目标次数") },
+                        supportingText = { Text("默认 $suggestedReward · 最多 $maxReward ⭐") },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                     Spacer(Modifier.width(8.dp))
                     OutlinedTextField(
                         value = reward,
-                        onValueChange = { input -> reward = input.filter { it.isDigit() }.take(4) },
+                        // Digit budget tracks the scaled cap (a 100-step plan pays
+                        // 500, which needs three digits), so the field accepts every
+                        // legal value instead of truncating a valid one.
+                        onValueChange = { input ->
+                            rewardTouched = true
+                            reward = input.filter { it.isDigit() }.take(rewardDigits)
+                        },
                         label = { Text("完成奖励⭐") },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
@@ -370,8 +403,11 @@ private fun PlanEditDialog(
                             title = title.trim(),
                             note = note.trim(),
                             emoji = emoji.ifBlank { "🎯" }.take(4),
-                            targetCount = target.toIntOrNull()?.coerceAtLeast(1) ?: 21,
-                            starReward = reward.toIntOrNull()?.coerceIn(0, 9999) ?: 20
+                            targetCount = targetInt,
+                            starReward = RewardEngine.clampPlanReward(
+                                reward.toIntOrNull(),
+                                targetInt
+                            )
                         )
                     )
                 }

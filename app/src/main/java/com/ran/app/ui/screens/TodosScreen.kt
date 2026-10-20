@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.ran.app.core.RewardEngine
 import com.ran.app.core.TimeUtils
 import com.ran.app.data.local.TodoEntity
 import com.ran.app.data.local.TodoPriority
@@ -208,7 +209,7 @@ private fun TodoRow(
                     PriorityChip(todo.priority, priorityColor)
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "+${todo.starReward}⭐",
+                        text = "+${RewardEngine.clampTodoReward(todo.starReward)}⭐",
                         fontSize = 11.sp,
                         color = Color(0xFF8A6B00)
                     )
@@ -290,7 +291,9 @@ private fun TodoEditDialog(
     var title by rememberSaveable { mutableStateOf(todo?.title ?: "") }
     var note by rememberSaveable { mutableStateOf(todo?.note ?: "") }
     var priority by rememberSaveable { mutableStateOf(todo?.priority ?: TodoPriority.MEDIUM) }
-    var reward by rememberSaveable { mutableStateOf((todo?.starReward ?: 5).toString()) }
+    var reward by rememberSaveable {
+        mutableStateOf(RewardEngine.clampTodoReward(todo?.starReward).toString())
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -350,8 +353,9 @@ private fun TodoEditDialog(
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = reward,
-                    onValueChange = { input -> reward = input.filter { it.isDigit() }.take(4) },
+                    onValueChange = { input -> reward = input.filter { it.isDigit() }.take(2) },
                     label = { Text("完成奖励⭐") },
+                    supportingText = { Text("最多 ${RewardEngine.MAX_TODO_REWARD} ⭐") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -366,7 +370,7 @@ private fun TodoEditDialog(
                             title = title.trim(),
                             note = note.trim(),
                             priority = priority,
-                            starReward = reward.toIntOrNull()?.coerceIn(0, 9999) ?: 5
+                            starReward = RewardEngine.clampTodoReward(reward.toIntOrNull())
                         )
                     )
                 }

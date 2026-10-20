@@ -18,7 +18,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -54,8 +59,13 @@ fun HomeScreen(
     activePlanTitles: List<String>,
     modifier: Modifier = Modifier,
     onNavigatePlans: () -> Unit = {},
-    onNavigateLottery: () -> Unit = {}
+    onNavigateLottery: () -> Unit = {},
+    onResetStars: (String) -> Unit = {}
 ) {
+    // Held here rather than in the ViewModel: the dialog is pure presentation,
+    // and the passphrase should not survive a configuration change in state.
+    var showResetDialog by rememberSaveable { mutableStateOf(false) }
+
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
@@ -77,8 +87,96 @@ fun HomeScreen(
                 OpenPlansCard(activePlanTitles, onNavigatePlans)
             }
         }
-        item { VerticalSpace(8) }
+        item {
+            VerticalSpace(8)
+            ResetStarsCard(onClick = { showResetDialog = true })
+        }
     }
+
+    if (showResetDialog) {
+        PassphraseDialog(
+            title = "清零积分",
+            message = "这会把当前积分归零（包括欠账）。请输入口令确认。",
+            confirmText = "清零",
+            onConfirm = { passphrase ->
+                showResetDialog = false
+                onResetStars(passphrase)
+            },
+            onDismiss = { showResetDialog = false }
+        )
+    }
+}
+
+/**
+ * The reset control, kept at the very bottom of the home screen.
+ *
+ * Placed last and worded neutrally on purpose. A destructive action that sits
+ * next to the balance is one tap away from a curious finger; this one requires
+ * scrolling to the end *and* typing a passphrase.
+ */
+@Composable
+private fun ResetStarsCard(onClick: () -> Unit) {
+    SectionCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center
+        ) {
+            TextButton(onClick = onClick) {
+                Text(
+                    "重置积分",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Asks for a passphrase before an irreversible action.
+ *
+ * The field is masked because the passphrase is shown in plain text on the
+ * keyboard's suggestion strip otherwise, and because a passphrase the user can
+ * read off their own screen is a passphrase a shoulder-surfer can read too.
+ */
+@Composable
+private fun PassphraseDialog(
+    title: String,
+    message: String,
+    confirmText: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var entry by rememberSaveable { mutableStateOf("") }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text(message, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+                androidx.compose.material3.OutlinedTextField(
+                    value = entry,
+                    onValueChange = { entry = it },
+                    label = { Text("口令") },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Password
+                    )
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(entry) },
+                enabled = entry.isNotBlank()
+            ) {
+                Text(confirmText, color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @Composable

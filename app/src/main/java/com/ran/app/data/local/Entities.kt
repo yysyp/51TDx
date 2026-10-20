@@ -15,9 +15,26 @@ data class PrizeEntity(
     val title: String,
     val description: String = "",
     val emoji: String = "🎁",
-    val weight: Int = 10,
+    /**
+     * Share of the pool, as a percentage. The pool always sums to exactly 100.
+     *
+     * Double rather than Int so a share can be set precisely: with 18 prizes,
+     * whole percents leave almost nothing to give away when a prize moves, and
+     * the leftover has to land somewhere. Two decimals is the quantum —
+     * [com.ran.app.core.PrizeBalancer] does all its arithmetic in hundredths
+     * specifically so this field cannot drift.
+     */
+    val weight: Double = 10.0,
     val starCost: Int = 5,
     val isActive: Boolean = true,
+    /**
+     * Whether this prize participates in the pity timer.
+     *
+     * Stored on the prize rather than derived from cost: "what counts as a
+     * jackpot" is a product decision, and deriving it from a price threshold
+     * would silently promote a prize the moment its cost was edited.
+     */
+    val isJackpot: Boolean = false,
     val createdAt: Long = System.currentTimeMillis()
 )
 
@@ -120,6 +137,15 @@ data class FoodEntity(
 data class ReviewItemEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val content: String,
+    /**
+     * The answer half of a question/answer pair.
+     *
+     * Split from [content] deliberately: the retrieval test only works if the
+     * prompt and the answer are different things. With one field, the "recall"
+     * phase had nothing to hide and nothing to check against, so the user was
+     * asked to recall a string they were then shown unchanged.
+     */
+    val answer: String = "",
     /** SM-2 [SpacedRepetition.Difficulty] ordinal; sets the starting ease. */
     val difficulty: Int = SpacedRepetition.Difficulty.NORMAL.level,
     val stage: Int = 0,

@@ -5,6 +5,7 @@ import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -30,6 +31,29 @@ interface PrizeDao {
 
     @Delete
     suspend fun delete(prize: PrizeEntity)
+
+    /**
+     * Whole pool for the rebalancing pass.
+     *
+     * Explicitly ordered: the caller pairs this list positionally against the
+     * weights it computes, and SQLite makes no promise about row order without
+     * an ORDER BY.
+     */
+    @Query("SELECT * FROM prizes ORDER BY createdAt DESC, id ASC")
+    suspend fun all(): List<PrizeEntity>
+
+    /**
+     * Writes a whole rebalanced pool atomically.
+     *
+     * Individual updates are not enough. A rebalance touches up to 18 rows and
+     * the intermediate state sums to less than 100, so an interrupt part-way
+     * through would leave the user with a pool whose displayed percentages do
+     * not match the draw -- and nothing on screen would reveal it.
+     */
+    @Transaction
+    suspend fun replaceAll(prizes: List<PrizeEntity>) {
+        prizes.forEach { update(it) }
+    }
 }
 
 @Dao
@@ -42,6 +66,7 @@ interface DrawRecordDao {
 
     @Query("DELETE FROM draw_records")
     suspend fun clear()
+
 }
 
 @Dao
@@ -144,6 +169,15 @@ interface StarLedgerDao {
 
     @Insert
     suspend fun insert(entry: StarLedgerEntity): Long
+
+    /**
+     * Wipes the ledger, driving the balance to exactly zero.
+     *
+     * @return how many entries were removed, so the caller can report honestly
+     *   rather than claiming a reset that touched nothing
+     */
+    @Query("DELETE FROM star_ledger")
+    suspend fun clearAll(): Int
 }
 
 @Dao

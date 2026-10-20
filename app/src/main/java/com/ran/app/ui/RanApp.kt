@@ -123,7 +123,8 @@ fun RanApp() {
             when (currentTab) {
                 RanTab.HOME -> HomeScreen(
                     stats = stats,
-                    activePlanTitles = activePlans.map { it.title }
+                    activePlanTitles = activePlans.map { it.title },
+                    onResetStars = vm::resetStarBalance
                 )
                 RanTab.REVIEW -> ReviewScreen(
                     dueItems = dueReviews,
@@ -167,7 +168,10 @@ fun RanApp() {
                     drawState = drawState,
                     records = drawRecords,
                     starBalance = stats.stars,
-                    onDraw = vm::draw,
+                    onStartRoll = vm::startRoll,
+                    onStopRoll = vm::stopRoll,
+                    onScratched = vm::finishScratch,
+                    onScratchReminder = vm::remindToScratch,
                     onClearResult = vm::clearDrawResult,
                     onSave = vm::savePrize,
                     onDelete = vm::deletePrize

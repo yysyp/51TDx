@@ -8,12 +8,14 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -29,6 +31,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -55,24 +59,28 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ran.app.data.local.DrawRecordEntity
 import com.ran.app.data.local.PrizeEntity
+import com.ran.app.ui.DrawPhase
 import com.ran.app.ui.DrawUiState
 import com.ran.app.ui.components.ConfirmDialog
 import com.ran.app.ui.components.EmptyHint
 import com.ran.app.ui.components.PulsingActionLabel
+import com.ran.app.ui.components.ScratchReveal
 import com.ran.app.ui.components.SectionCard
 import com.ran.app.ui.components.SectionTitle
 import com.ran.app.ui.components.VerticalSpace
 import com.ran.app.ui.theme.Amber
 import com.ran.app.ui.theme.Coral
+import com.ran.app.ui.theme.Teal
 import com.ran.app.core.TimeUtils
 
 /**
  * Lottery screen.
  *
- * The roll uses a decelerating sequence rather than an instant result. This is
- * a variable-ratio schedule: because rewards are unpredictable and the reveal
- * takes effort, the behaviour resists extinction far better than a fixed,
- * immediate payout would.
+ * A draw runs in three deliberate beats rather than one instant reveal:
+ * press to start the roll, press again to stop it, then scratch the coating to
+ * find out what landed. Each beat adds a little ceremony, and the ceremony is
+ * the point: anticipation is most of what a variable-ratio reward is made of,
+ * so the reveal is stretched out on purpose rather than optimised away.
  */
 @Composable
 fun LotteryScreen(
@@ -81,7 +89,10 @@ fun LotteryScreen(
     records: List<DrawRecordEntity>,
     starBalance: Int,
     modifier: Modifier = Modifier,
-    onDraw: () -> Unit,
+    onStartRoll: () -> Unit,
+    onStopRoll: () -> Unit,
+    onScratched: () -> Unit,
+    onScratchReminder: () -> Unit,
     onClearResult: () -> Unit,
     onSave: (PrizeEntity) -> Unit,
     onDelete: (PrizeEntity) -> Unit
@@ -96,7 +107,15 @@ fun LotteryScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            DrawMachineCard(drawState, starBalance, onDraw, onClearResult)
+            DrawMachineCard(
+                drawState = drawState,
+                starBalance = starBalance,
+                onStartRoll = onStartRoll,
+                onStopRoll = onStopRoll,
+                onScratched = onScratched,
+                onScratchReminder = onScratchReminder,
+                onClearResult = onClearResult
+            )
         }
         item {
             SectionCard {
@@ -185,11 +204,15 @@ fun LotteryScreen(
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun DrawMachineCard(
     drawState: DrawUiState,
     starBalance: Int,
-    onDraw: () -> Unit,
+    onStartRoll: () -> Unit,
+    onStopRoll: () -> Unit,
+    onScratched: () -> Unit,
+    onScratchReminder: () -> Unit,
     onClearResult: () -> Unit
 ) {
     Box(
@@ -201,78 +224,167 @@ private fun DrawMachineCard(
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            // Idle breathing motion invites tapping without demanding attention.
-            val transition = rememberInfiniteTransition(label = "machineIdle")
-            val idleScale by transition.animateFloat(
-                initialValue = 1f,
-                targetValue = if (drawState.isRolling) 1f else 1.03f,
-                animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
-                label = "idleScale"
-            )
-
-            val displayEmoji = drawState.result?.prizeEmoji
-                ?: drawState.rollingItem?.emoji
-                ?: "🎰"
-
-            Box(
-                modifier = Modifier
-                    .size(130.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.75f))
-                    .border(3.dp, Color.White, CircleShape)
-                    .scale(idleScale),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(text = displayEmoji, fontSize = 58.sp)
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            Text(
-                text = when {
-                    drawState.result != null -> "恭喜获得：${drawState.result.prizeTitle}"
-                    drawState.isRolling -> "抽签中…"
-                    else -> "点击下方按钮抽一个奖励"
-                },
-                style = MaterialTheme.typography.titleMedium,
-                color = Color(0xFF6B4E2E)
-            )
-
-            Spacer(Modifier.height(4.dp))
-
-            Text(
-                text = "当前星星：$starBalance",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFF8A6B45)
-            )
-
-            Spacer(Modifier.height(16.dp))
-
-            Button(
-                onClick = {
-                    if (drawState.result != null) onClearResult() else onDraw()
-                },
-                enabled = !drawState.isRolling,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Coral,
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(50),
-                modifier = Modifier.height(50.dp)
-            ) {
-                PulsingActionLabel(
-                    text = when {
-                        drawState.isRolling -> "抽签中…"
-                        drawState.result != null -> "再抽一次"
-                        else -> "开始抽奖"
-                    }
+            when (drawState.phase) {
+                DrawPhase.SCRATCH, DrawPhase.DONE -> ScratchResultCard(
+                    drawState = drawState,
+                    onScratched = onScratched
+                )
+                else -> MachineFace(
+                    drawState = drawState,
+                    starBalance = starBalance
                 )
             }
 
-            if (drawState.result != null) {
+            Spacer(Modifier.height(16.dp))
+
+            val label = when (drawState.phase) {
+                DrawPhase.IDLE -> "开始"
+                DrawPhase.ROLLING -> "停"
+                DrawPhase.SCRATCH -> "👆 先刮开涂层"
+                DrawPhase.DONE -> "再来一次"
+            }
+            val scratching = drawState.phase == DrawPhase.SCRATCH
+            Button(
+                onClick = {
+                    when (drawState.phase) {
+                        DrawPhase.IDLE -> onStartRoll()
+                        DrawPhase.ROLLING -> onStopRoll()
+                        // Deliberately inert: a tap here used to call
+                        // onClearResult and skip the reveal the whole scratch
+                        // step exists to create. Long press is the deliberate
+                        // escape hatch, so a stuck card is still openable.
+                        DrawPhase.SCRATCH -> onScratchReminder()
+                        DrawPhase.DONE -> onClearResult()
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = when (drawState.phase) {
+                        DrawPhase.ROLLING -> Teal
+                        DrawPhase.SCRATCH -> Color(0xFFB9BDC9)
+                        else -> Coral
+                    },
+                    contentColor = Color.White
+                ),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier
+                    .height(52.dp)
+                    .combinedClickable(
+                        onClick = {
+                            when (drawState.phase) {
+                                DrawPhase.IDLE -> onStartRoll()
+                                DrawPhase.ROLLING -> onStopRoll()
+                                DrawPhase.SCRATCH -> onScratchReminder()
+                                DrawPhase.DONE -> onClearResult()
+                            }
+                        },
+                        onLongClick = { if (scratching) onScratched() }
+                    )
+            ) {
+                PulsingActionLabel(
+                    text = label,
+                    pulsing = drawState.phase == DrawPhase.ROLLING
+                )
+            }
+
+            if (scratching) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "用手指把涂层刮开 · 长按按钮可直接揭晓",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF8A6B45)
+                )
+            }
+            if (drawState.phase == DrawPhase.DONE) {
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = onClearResult) { Text("返回", color = Color(0xFF8A6B45)) }
             }
+        }
+    }
+}
+
+/** The spinning dial plus the balance readout, shown while rolling or idle. */
+@Composable
+private fun MachineFace(drawState: DrawUiState, starBalance: Int) {
+    val transition = rememberInfiniteTransition(label = "machineIdle")
+    val idleScale by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = if (drawState.phase == DrawPhase.ROLLING) 1f else 1.03f,
+        animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
+        label = "idleScale"
+    )
+    val rolling = drawState.phase == DrawPhase.ROLLING
+
+    Box(
+        modifier = Modifier
+            .size(130.dp)
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = 0.75f))
+            .border(3.dp, Color.White, CircleShape)
+            .scale(if (rolling) 1.06f else idleScale),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = drawState.rollingItem?.emoji ?: "🎰", fontSize = 58.sp)
+    }
+
+    Spacer(Modifier.height(14.dp))
+    Text(
+        text = when {
+            rolling -> "滚着呢，点「停」揭晓"
+            else -> "星星 $starBalance ，点「开始」"
+        },
+        style = MaterialTheme.typography.titleMedium,
+        color = Color(0xFF6B4E2E)
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        text = if (starBalance < 0) "当前欠着 ${-starBalance} 星，抽奖不拦你" else "星星不够也能抽，会先欠着",
+        style = MaterialTheme.typography.labelSmall,
+        color = if (starBalance < 0) Coral else Color(0xFF8A6B45)
+    )
+}
+
+/** The prize sitting under the coating, with the scratch layer on top. */
+@Composable
+private fun ScratchResultCard(drawState: DrawUiState, onScratched: () -> Unit) {
+    val record = drawState.result ?: return
+    val revealed = drawState.phase == DrawPhase.DONE
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(170.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (record.isJackpot) Color(0xFFFFF1D6) else Color.White)
+            .border(
+                width = if (record.isJackpot) 3.dp else 1.dp,
+                color = if (record.isJackpot) Coral else Color(0x33000000),
+                shape = RoundedCornerShape(18.dp)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(text = record.prizeEmoji, fontSize = 46.sp)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = record.prizeTitle,
+                style = MaterialTheme.typography.titleLarge,
+                color = Color(0xFF6B4E2E)
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (record.isJackpot) "头奖！扣除 ${record.starCost} ⭐" else "扣除 ${record.starCost} ⭐",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (record.isJackpot) Coral else Color(0xFF8A6B45)
+            )
+        }
+
+        if (!revealed) {
+            ScratchReveal(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(18.dp)),
+                onRevealed = onScratched
+            )
         }
     }
 }
@@ -290,7 +402,7 @@ private fun PrizeRow(prize: PrizeEntity, onEdit: () -> Unit, onDelete: () -> Uni
             Column(Modifier.weight(1f)) {
                 Text(prize.title, style = MaterialTheme.typography.titleMedium)
                 Text(
-                    text = prize.description.ifBlank { "权重 ${prize.weight}" },
+                    text = prize.description.ifBlank { "中奖概率 ${com.ran.app.core.PrizeBalancer.format(prize.weight)}%" },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -378,8 +490,9 @@ private fun PrizeEditDialog(
     var title by rememberSaveable { mutableStateOf(prize?.title ?: "") }
     var description by rememberSaveable { mutableStateOf(prize?.description ?: "") }
     var emoji by rememberSaveable { mutableStateOf(prize?.emoji ?: "🎁") }
-    var weight by rememberSaveable { mutableStateOf((prize?.weight ?: 10).toString()) }
+    var weight by rememberSaveable { mutableStateOf(com.ran.app.core.PrizeBalancer.format(prize?.weight ?: com.ran.app.core.PrizeBalancer.defaultWeight())) }
     var cost by rememberSaveable { mutableStateOf((prize?.starCost ?: 5).toString()) }
+    var jackpot by rememberSaveable { mutableStateOf(prize?.isJackpot ?: false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -421,15 +534,50 @@ private fun PrizeEditDialog(
                     Spacer(Modifier.width(8.dp))
                     OutlinedTextField(
                         value = weight,
-                        onValueChange = { input -> weight = input.filter { it.isDigit() }.take(3) },
-                        label = { Text("权重") },
+                        // One decimal point, at most two decimals: the
+                        // balancer's quantum is 0.01, so accepting more digits
+                        // would only store a number nothing can ever match.
+                        onValueChange = { input ->
+                            val cleaned = input.filter { it.isDigit() || it == '.' }
+                            val firstDot = cleaned.indexOf('.')
+                            val trimmed = if (firstDot < 0) {
+                                cleaned
+                            } else {
+                                cleaned.substring(0, firstDot + 1) +
+                                    cleaned.substring(firstDot + 1).replace(".", "")
+                            }
+                            weight = trimmed.take(6)
+                        },
+                        label = { Text("中奖概率 %") },
+                        supportingText = { Text("其余奖项自动按比例调整") },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                 }
                 Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { jackpot = !jackpot }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = jackpot,
+                        onCheckedChange = { jackpot = it },
+                        colors = CheckboxDefaults.colors(checkedColor = Coral)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "标记为头奖（历史记录里高亮显示）",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Text(
-                    text = "权重越高越容易抽中；星星消耗可让大奖更有分量",
+                    text = "填 10 就是 10% 中奖率。全部奖项合计 100%，" +
+                        "改这一项时其余奖项会按比例自动让出空间。星星消耗决定扣多少。",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -444,8 +592,15 @@ private fun PrizeEditDialog(
                             title = title.trim(),
                             description = description.trim(),
                             emoji = emoji.ifBlank { "🎁" }.take(4),
-                            weight = weight.toIntOrNull()?.coerceIn(1, 999) ?: 10,
-                            starCost = cost.toIntOrNull()?.coerceIn(0, 9999) ?: 5
+                            weight = com.ran.app.core.PrizeBalancer.quantize(
+                                weight.toDoubleOrNull()
+                                    ?: com.ran.app.core.PrizeBalancer.defaultWeight()
+                            ).coerceIn(
+                                com.ran.app.core.PrizeBalancer.MIN_WEIGHT,
+                                com.ran.app.core.PrizeBalancer.TOTAL
+                            ),
+                            starCost = cost.toIntOrNull()?.coerceIn(0, 9999) ?: 5,
+                            isJackpot = jackpot
                         )
                     )
                 }

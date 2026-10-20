@@ -54,8 +54,8 @@ that is hard to reach stops behaving as a reward.
 | Action | Stars |
 | --- | --- |
 | Plan check-in | +3 |
-| Plan completed | +23 (20 bonus + 3) |
-| Todo completed | +5 (configurable per item) |
+| Plan completed | target x 3 default (target x 5 cap) — 10 steps pays 30, max 50 |
+| Todo completed | +5 default (user-set per item, capped at 10) |
 | Review item recorded | +2 / +3 / +4 (by difficulty) |
 | Review completed | +1 to +6 (difficulty x recall quality), ~15% chance of doubling |
 | First-run gift | +10 |
@@ -66,6 +66,20 @@ stops motivating — the pet exists to make those stars go somewhere durable.
 
 The cheapest action costs 3 so that even a day with almost no earnings can
 still afford a hello; a pet you cannot greet cheaply is a pet you stop visiting.
+
+User-authored rewards are capped. A plan's completion reward scales with its
+target count (3 stars per step by default, 5 per step at most) rather than
+against a flat ceiling — a flat cap would make a 2-step plan worth more than a
+30-step plan, inverting exactly the incentive the target count is meant to
+create. A todo, having no target count to scale by, is capped at a flat
+`MAX_TODO_REWARD` = 10.
+
+A reward the user types is a reward they can mint at will, and self-issued
+currency collapses the economy: if one tap could be worth 500, every other
+source of stars becomes noise. The cap is enforced on the **granting** path,
+not just in the editor — rows written before the cap existed may still hold
+absurd values, and reopening a todo refunds the same clamped amount so grant
+and refund always agree.
 
 All star movements are written to an append-only `star_ledger` table, so the
 balance is always derivable and auditable. Spending is refused when the
@@ -153,14 +167,21 @@ Without `GRADLE_HOME` they fall back to `./gradlew`.
 
 ## Tests
 
-**63 tests, all green** (run for both the debug and release variants):
+**99 tests, all green** (run for both the debug and release variants):
 
-- `RewardEngineTest.kt` (16) — the reward economy, the part that silently
+- `RewardEngineTest.kt` (26) — the reward economy, the part that silently
   corrupts the whole feedback loop if it drifts:
   - weighted random selection, including zero/negative weights and an empty pool
   - goal-gradient easing monotonicity and bounds
   - the endowed-progress daily goal never regressing
   - level thresholds and `levelFor` being mutual inverses
+  - user-authored rewards clamped, negatives floored, unusable input falling
+    back to a default
+  - plan reward scaling with target count (default target x 3, cap target x 5)
+  - the scaled cap never inverting: walking targets 1..40, the cap increases
+    monotonically and the default never exceeds it
+  - legacy rows holding pre-cap values still paying only the capped amount, with
+    grant and refund staying equal
 - `SpacedRepetitionTest.kt` (11) — SM-2 scheduling: the seeded 1/3-day start,
   earned, ease bounds, strict interval growth even at minimum ease, mastery
   defined by interval length, harder material graduating later, failure still
@@ -185,6 +206,19 @@ Without `GRADLE_HOME` they fall back to `./gradlew`.
   disable today's button, same-day records are collected and de-duplicated, day
   keys and start-of-day timestamps are mutual inverses, and "now" always falls
   inside today's window.
+- `PrizeBalancerTest.kt` (15) — percentage weights that always sum to exactly
+  100: normalisation landing on the total (computed in integer hundredths, since
+  float scaling drifts across rows), ratios surviving a rescale, impossible
+  requests being clamped rather than obeyed, no prize ever floored to zero, and
+  new/removed prizes making room for each other.
+- `LotteryEconomyTest.kt` (8) — the lottery and the pet shop compete for one
+  wallet, so these lock the ratio between "expected cost per draw" and "priciest
+  accessory" at 6–11. Tune one side without the other and this fails, which is
+  the point: a cheaper draw with unchanged pet prices silently raises the cost of
+  everything earned.
+- `StarResetTest.kt` (3) — the star-reset passphrase: the exact string is
+  accepted and twelve near misses (missing digit, extra digit, padding space,
+  embedded newline, full-width digits, pinyin) are all rejected.
 
 The day-boundary tests guard a real bug found after release: "today" was read
 once and cached, while the flows behind the UI only emit when the database

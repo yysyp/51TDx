@@ -12,6 +12,7 @@ import com.ran.app.core.TimeUtils
 import com.ran.app.data.CheckInResult
 import com.ran.app.data.DrawResult
 import com.ran.app.data.RanRepository
+import com.ran.app.data.isResetAuthorised
 import com.ran.app.data.ReviewSummary
 import com.ran.app.data.ToggleTodoResult
 import com.ran.app.data.local.FoodEntity
@@ -19,6 +20,7 @@ import com.ran.app.data.local.PlanEntity
 import com.ran.app.data.local.PrizeEntity
 import com.ran.app.data.local.ReviewItemEntity
 import com.ran.app.data.local.TodoEntity
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -85,6 +87,8 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
     private val _drawState = MutableStateFlow(DrawUiState())
     val drawState: StateFlow<DrawUiState> = _drawState.asStateFlow()
 
+    private var rollJob: Job? = null
+
     // Food picker state
     private val _foodPick = MutableStateFlow<FoodEntity?>(null)
     val foodPick: StateFlow<FoodEntity?> = _foodPick.asStateFlow()
@@ -135,6 +139,32 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---------- Lottery ----------
 
+    /**
+     * Clears the star balance after a passphrase check.
+     *
+     * The check is here rather than in the repository so the UI can react to a
+     * wrong passphrase without touching the database, and so an unauthorised
+     * attempt never becomes a write.
+     */
+    fun resetStarBalance(passphrase: String) = viewModelScope.launch {
+        if (!isResetAuthorised(passphrase)) {
+            emit("口令不对，积分没有清零", isError = true)
+            return@launch
+        }
+        val before = repo.currentBalance()
+        val removed = repo.resetStarBalance()
+        emit(
+            when {
+                removed == 0 -> "当前没有积分记录，无需清零"
+                before < 0 -> "已清零，${-before} 星欠账一笔勾销"
+                else -> "积分已清零（原 ${before} ⭐）"
+            },
+            // Negative so the balance ticker counts *down* to zero, which is what
+            // happened; a positive delta would fly upwards against the change.
+            stars = -before
+        )
+    }
+
     fun savePrize(prize: PrizeEntity) = viewModelScope.launch { repo.savePrize(prize) }
 
     fun deletePrize(prize: PrizeEntity) = viewModelScope.launch {
@@ -142,49 +172,107 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
         emit("已删除「${prize.title}」")
     }
 
-    /** Runs the roll animation, then commits the draw in the repository. */
-    fun draw() {
-        if (_drawState.value.isRolling) return
-        viewModelScope.launch {
-            val pool = prizes.value.filter { it.isActive }
-            if (pool.isEmpty()) {
-                emit("奖池是空的，先添加几个奖项吧", isError = true)
-                return@launch
-            }
-            _drawState.value = DrawUiState(isRolling = true)
-            // Decelerating roll: fast early, slowing into the result.
-            var stepDelay = 55L
+    /**
+     * Stage one: start the roll. Nothing is decided yet — the draw is only
+     * committed when the user stops it.
+     */
+    fun startRoll() {
+        val state = _drawState.value
+        if (state.phase != DrawPhase.IDLE) return
+        val pool = prizes.value.filter { it.isActive }
+        if (pool.isEmpty()) {
+            emit("奖池是空的，先添加几个奖项吧", isError = true)
+            return
+        }
+        _drawState.value = state.copy(
+            phase = DrawPhase.ROLLING,
+            rollingItem = pool.random(),
+            result = null
+        )
+        rollJob?.cancel()
+        rollJob = viewModelScope.launch {
+            // Continuous cycle at a steady clip. The user decides when it ends,
+            // so this is not a scripted deceleration: it is the machine running
+            // while the hand is on the button.
             var visible = pool.random()
-            repeat(28) {
+            while (true) {
+                delay(70L)
                 visible = pool.random()
                 _drawState.value = _drawState.value.copy(rollingItem = visible)
+            }
+        }
+    }
+
+    /**
+     * Stage two: stop the roll and commit the draw.
+     *
+     * The deceleration is short on purpose. The suspense is now the player's
+     * own timing rather than a timer they wait out, so a long wind-down would be
+     * dead time between deciding and finding out.
+     */
+    fun stopRoll() {
+        if (_drawState.value.phase != DrawPhase.ROLLING) return
+        rollJob?.cancel()
+        rollJob = null
+        viewModelScope.launch {
+            var stepDelay = 70L
+            repeat(6) {
+                _drawState.value = _drawState.value.copy(rollingItem = prizes.value.randomOrNull())
                 delay(stepDelay)
-                stepDelay = (stepDelay * 1.18).toLong().coerceAtMost(260L)
+                stepDelay = (stepDelay * 1.35).toLong().coerceAtMost(300L)
             }
             when (val result = repo.drawPrize()) {
                 is DrawResult.Success -> {
-                    _drawState.value = DrawUiState(
-                        isRolling = false,
+                    _drawState.value = _drawState.value.copy(
+                        phase = DrawPhase.SCRATCH,
                         result = result.record,
-                        rollingItem = result.record.let { pool.random() }
+                        rollingItem = null
                     )
-                    val msg = if (result.record.isJackpot) "大奖！${result.record.prizeEmoji} ${result.record.prizeTitle}"
-                    else "${result.record.prizeEmoji} ${result.record.prizeTitle}"
-                    emit(msg, stars = 0)
-                }
-                DrawResult.NotEnoughStars -> {
-                    _drawState.value = DrawUiState()
-                    emit("星星不够，先去完成任务赚星星吧", isError = true)
                 }
                 DrawResult.EmptyPool -> {
                     _drawState.value = DrawUiState()
                     emit("奖池是空的，先添加几个奖项吧", isError = true)
                 }
+                // Unreachable while the draw allows debt; kept so a future change
+                // to that rule fails loudly here instead of silently.
+                DrawResult.NotEnoughStars -> {
+                    _drawState.value = DrawUiState()
+                    emit("星星不够，先去完成任务赚星星吧", isError = true)
+                }
             }
         }
     }
 
+    /** Stage three: the coating has been scratched away. */
+    fun finishScratch() {
+        if (_drawState.value.phase != DrawPhase.SCRATCH) return
+        val record = _drawState.value.result ?: return
+        _drawState.value = _drawState.value.copy(phase = DrawPhase.DONE)
+        val msg = if (record.isJackpot) {
+            "头奖！${record.prizeEmoji} ${record.prizeTitle}"
+        } else {
+            "${record.prizeEmoji} ${record.prizeTitle}"
+        }
+        emit(msg, stars = 0)
+    }
+
+    /**
+     * A plain tap on the button while the coating is still intact.
+     *
+     * Used to end the draw outright, which quietly removed the entire reveal the
+     * scratch step exists for -- the result was settled and discarded before the
+     * user ever saw it. Now it only prompts; [finishScratch] runs when the
+     * coating is actually opened.
+     */
+    fun remindToScratch() {
+        if (_drawState.value.phase != DrawPhase.SCRATCH) return
+        emit("用手指把涂层刮开才揭晓哦", isError = false)
+    }
+
+    /** Back to idle, ready for the next draw. */
     fun clearDrawResult() {
+        rollJob?.cancel()
+        rollJob = null
         _drawState.value = DrawUiState()
     }
 
@@ -200,7 +288,14 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
     fun checkIn(plan: PlanEntity) = viewModelScope.launch {
         when (val result = repo.checkIn(plan.id)) {
             CheckInResult.AlreadyCheckedIn -> emit("今天已经打过卡了，明天继续", isError = true)
-            is CheckInResult.Completed -> emit("计划完成！+${RewardEngine.STAR_PLAN_COMPLETE + RewardEngine.STAR_CHECK_IN} 星", stars = RewardEngine.STAR_PLAN_COMPLETE + RewardEngine.STAR_CHECK_IN)
+            is CheckInResult.Completed -> {
+                val total = result.starsGained + result.finishBonus
+                emit(
+                    "计划完成！+${result.starsGained} 星" +
+                        if (result.finishBonus > 0) "，另有达成奖励 +${result.finishBonus} 星" else "",
+                    stars = total
+                )
+            }
             is CheckInResult.Progressed -> {
                 val remaining = result.target - result.current
                 emit("打卡成功，还差 $remaining 次", stars = RewardEngine.STAR_CHECK_IN)
@@ -274,9 +369,13 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
      * because an open loop is what pulls people back — the Zeigarnik effect,
      * reused here on memory rather than on tasks.
      */
-    fun addReviewItem(rawContent: String, difficulty: SpacedRepetition.Difficulty = SpacedRepetition.Difficulty.NORMAL) =
+    fun addReviewItem(
+        question: String,
+        answer: String = "",
+        difficulty: SpacedRepetition.Difficulty = SpacedRepetition.Difficulty.NORMAL
+    ) =
         viewModelScope.launch {
-            val result = repo.recordReviews(rawContent, difficulty)
+            val result = repo.recordReviews(question, answer, difficulty)
             when {
                 result.created == 0 -> emit("先写点今天学到的东西吧", isError = true)
                 result.created == 1 -> emit(
@@ -314,7 +413,15 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
                 if (result.mastered) "已经刻进长期记忆，出师了 🎓"
                 else "又想起来一次！${result.intervalDays} 天后再见它"
         }
-        emit("$prefix$tail +${result.starsGained} 星", stars = result.starsGained)
+        // Named in the copy on purpose: an unannounced bonus teaches nothing
+        // except that the numbers moved. Saying "today's 5th card" makes the
+        // next one worth reaching for.
+        val streakNote = if (result.streakBonus > 0) {
+            "（今日第 ${result.reviewsToday} 张，加成 +${result.streakBonus}）"
+        } else {
+            ""
+        }
+        emit("$prefix$tail +${result.starsGained} 星$streakNote", stars = result.starsGained)
     }
 
     fun deleteReviewItem(item: ReviewItemEntity) = viewModelScope.launch {
@@ -390,8 +497,14 @@ class RanViewModel(application: Application) : AndroidViewModel(application) {
     fun currentBalanceNow(callback: (Int) -> Unit) = viewModelScope.launch { callback(repo.currentBalance()) }
 }
 
+/** The three stages a draw moves through, in order. */
+enum class DrawPhase { IDLE, ROLLING, SCRATCH, DONE }
+
 data class DrawUiState(
-    val isRolling: Boolean = false,
+    val phase: DrawPhase = DrawPhase.IDLE,
     val rollingItem: com.ran.app.data.local.PrizeEntity? = null,
     val result: com.ran.app.data.local.DrawRecordEntity? = null
-)
+) {
+    /** Kept so callers that only care about "is the machine running" read clearly. */
+    val isRolling: Boolean get() = phase == DrawPhase.ROLLING
+}

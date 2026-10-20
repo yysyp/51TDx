@@ -207,12 +207,12 @@ object PetEngine {
         val carePoints: Int
     ) {
         DRINK("🥛", "喂口水", 3, 4, 6, 1),
-        SNACK("🍪", "小零食", 5, 12, 4, 1),
-        MEAL("🍚", "正餐", 12, 32, 10, 2),
-        DESSERT("🍰", "小蛋糕", 8, 8, 22, 1),
-        PLAY("🎾", "陪它玩", 10, -10, 25, 3),
-        CLEAN("🧹", "打扫小窝", 4, 0, 14, 1),
-        GROOM("🧴", "梳毛洗澡", 6, 0, 14, 1);
+        SNACK("🍪", "小零食", 4, 12, 4, 1),
+        MEAL("🍚", "正餐", 10, 32, 10, 2),
+        DESSERT("🍰", "小蛋糕", 7, 8, 22, 1),
+        PLAY("🎾", "陪它玩", 8, -10, 25, 3),
+        CLEAN("🧹", "打扫小窝", 3, 0, 14, 1),
+        GROOM("🧴", "梳毛洗澡", 5, 0, 14, 1);
 
         companion object {
             fun all(): List<Action> = entries.toList()
@@ -293,36 +293,36 @@ object PetEngine {
      */
     val CATALOG: List<Accessory> = listOf(
         // Head
-        Accessory("beanie", "毛线帽", "🧢", 18, Slot.HAT, Rarity.COMMON),
-        Accessory("bow", "蝴蝶结", "🎀", 15, Slot.HAT, Rarity.COMMON),
-        Accessory("straw", "小草帽", "👒", 26, Slot.HAT, Rarity.COMMON),
-        Accessory("wizard", "巫师帽", "🧙", 48, Slot.HAT, Rarity.RARE),
-        Accessory("crown", "小王冠", "👑", 60, Slot.HAT, Rarity.LEGEND),
-        Accessory("halo", "小光环", "😇", 72, Slot.HAT, Rarity.LEGEND),
+        Accessory("beanie", "毛线帽", "🧢", 15, Slot.HAT, Rarity.COMMON),
+        Accessory("bow", "蝴蝶结", "🎀", 12, Slot.HAT, Rarity.COMMON),
+        Accessory("straw", "小草帽", "👒", 22, Slot.HAT, Rarity.COMMON),
+        Accessory("wizard", "巫师帽", "🧙", 40, Slot.HAT, Rarity.RARE),
+        Accessory("crown", "小王冠", "👑", 50, Slot.HAT, Rarity.LEGEND),
+        Accessory("halo", "小光环", "😇", 60, Slot.HAT, Rarity.LEGEND),
 
         // Face
-        Accessory("glasses", "小眼镜", "👓", 22, Slot.FACE, Rarity.COMMON),
-        Accessory("sunglasses", "墨镜", "🕶️", 30, Slot.FACE, Rarity.COMMON),
-        Accessory("mask", "小口罩", "😷", 20, Slot.FACE, Rarity.COMMON),
-        Accessory("nose", "小丑鼻", "🤡", 24, Slot.FACE, Rarity.COMMON),
-        Accessory("spyglass", "侦探镜", "🔍", 32, Slot.FACE, Rarity.RARE),
-        Accessory("goggles", "小泳镜", "🥽", 36, Slot.FACE, Rarity.RARE),
+        Accessory("glasses", "小眼镜", "👓", 18, Slot.FACE, Rarity.COMMON),
+        Accessory("sunglasses", "墨镜", "🕶️", 25, Slot.FACE, Rarity.COMMON),
+        Accessory("mask", "小口罩", "😷", 17, Slot.FACE, Rarity.COMMON),
+        Accessory("nose", "小丑鼻", "🤡", 20, Slot.FACE, Rarity.COMMON),
+        Accessory("spyglass", "侦探镜", "🔍", 27, Slot.FACE, Rarity.RARE),
+        Accessory("goggles", "小泳镜", "🥽", 30, Slot.FACE, Rarity.RARE),
 
         // Neck
-        Accessory("tie", "领结", "🎗️", 24, Slot.NECK, Rarity.COMMON),
-        Accessory("scarf", "围巾", "🧣", 26, Slot.NECK, Rarity.COMMON),
-        Accessory("bell", "小铃铛", "🔔", 28, Slot.NECK, Rarity.COMMON),
-        Accessory("medal", "奖牌", "🏅", 45, Slot.NECK, Rarity.RARE),
-        Accessory("beads", "小项链", "📿", 50, Slot.NECK, Rarity.RARE),
-        Accessory("cape", "小披风", "🧥", 66, Slot.NECK, Rarity.LEGEND),
+        Accessory("tie", "领结", "🎗️", 20, Slot.NECK, Rarity.COMMON),
+        Accessory("scarf", "围巾", "🧣", 22, Slot.NECK, Rarity.COMMON),
+        Accessory("bell", "小铃铛", "🔔", 23, Slot.NECK, Rarity.COMMON),
+        Accessory("medal", "奖牌", "🏅", 38, Slot.NECK, Rarity.RARE),
+        Accessory("beads", "小项链", "📿", 42, Slot.NECK, Rarity.RARE),
+        Accessory("cape", "小披风", "🧥", 55, Slot.NECK, Rarity.LEGEND),
 
         // Behind
-        Accessory("flower", "小花", "🌸", 16, Slot.BACK, Rarity.COMMON),
-        Accessory("balloon", "气球", "🎈", 20, Slot.BACK, Rarity.COMMON),
-        Accessory("leaf", "小绿叶", "🍃", 22, Slot.BACK, Rarity.COMMON),
-        Accessory("cloud", "云朵", "☁️", 28, Slot.BACK, Rarity.COMMON),
-        Accessory("rocket", "小火箭", "🚀", 55, Slot.BACK, Rarity.RARE),
-        Accessory("wings", "翅膀", "🪽", 70, Slot.BACK, Rarity.LEGEND)
+        Accessory("flower", "小花", "🌸", 13, Slot.BACK, Rarity.COMMON),
+        Accessory("balloon", "气球", "🎈", 17, Slot.BACK, Rarity.COMMON),
+        Accessory("leaf", "小绿叶", "🍃", 18, Slot.BACK, Rarity.COMMON),
+        Accessory("cloud", "云朵", "☁️", 23, Slot.BACK, Rarity.COMMON),
+        Accessory("rocket", "小火箭", "🚀", 46, Slot.BACK, Rarity.RARE),
+        Accessory("wings", "翅膀", "🪽", 58, Slot.BACK, Rarity.LEGEND)
     )
 
     fun accessoryOf(id: String?): Accessory? = id?.let { wanted -> CATALOG.firstOrNull { it.id == wanted } }

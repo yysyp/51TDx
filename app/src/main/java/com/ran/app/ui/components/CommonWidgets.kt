@@ -106,11 +106,11 @@ fun EmptyHint(text: String, modifier: Modifier = Modifier) {
 
 /** Pulsing glow used to draw attention to the primary action without shouting. */
 @Composable
-fun PulsingActionLabel(text: String, modifier: Modifier = Modifier) {
+fun PulsingActionLabel(text: String, modifier: Modifier = Modifier, pulsing: Boolean = true) {
     val transition = rememberInfiniteTransition(label = "pulse")
     val scale by transition.animateFloat(
         initialValue = 1f,
-        targetValue = 1.04f,
+        targetValue = if (pulsing) 1.04f else 1f,
         animationSpec = infiniteRepeatable(tween(1100), RepeatMode.Reverse),
         label = "pulseScale"
     )

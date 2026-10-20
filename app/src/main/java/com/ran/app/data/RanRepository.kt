@@ -2,6 +2,7 @@ package com.ran.app.data
 
 import com.ran.app.core.DailyCycle
 import com.ran.app.core.PetEngine
+import com.ran.app.core.PrizeBalancer
 import com.ran.app.core.RewardEngine
 import com.ran.app.core.SpacedRepetition
 import com.ran.app.core.TimeUtils
@@ -39,7 +40,7 @@ import kotlinx.coroutines.flow.map
 sealed interface CheckInResult {
     data object AlreadyCheckedIn : CheckInResult
     data class Progressed(val planId: Long, val current: Int, val target: Int) : CheckInResult
-    data class Completed(val planId: Long) : CheckInResult
+    data class Completed(val planId: Long, val starsGained: Int, val finishBonus: Int) : CheckInResult
 }
 
 sealed interface DrawResult {
@@ -64,6 +65,10 @@ data class BatchReviewRecord(
 /** Outcome of one graded review. */
 data class ReviewOutcome(
     val starsGained: Int,
+    /** Tier bonus folded into [starsGained], reported separately for the copy. */
+    val streakBonus: Int = 0,
+    /** How many cards have been reviewed today, including this one. */
+    val reviewsToday: Int = 0,
     val nextDueDay: String,
     val intervalDays: Int,
     val mastered: Boolean,
@@ -107,6 +112,20 @@ data class ReviewSummary(
  * Star mutations are serialised through [awardStars]/[spendStars] so the
  * running balance in the ledger stays consistent even under rapid tapping.
  */
+/**
+ * The passcode that authorises a star-balance reset.
+ *
+ * This is a guard against a curious child, not a security control: the app is
+ * local-only and the string ships inside the APK, so anyone who unpacks the
+ * binary can read it. Treating it as a secret would be false comfort. What it
+ * actually buys is the thing it is for — a two-year-old cannot guess it, and an
+ * accidental tap cannot wipe a month of progress.
+ */
+const val RESET_PASSPHRASE = "行微易成54321"
+
+/** True when [input] may reset the balance. */
+fun isResetAuthorised(input: String): Boolean = input == RESET_PASSPHRASE
+
 class RanRepository(
     private val prizeDao: PrizeDao,
     private val drawRecordDao: DrawRecordDao,
@@ -178,11 +197,20 @@ class RanRepository(
         return balance
     }
 
-    /** Deducts [amount] stars. Returns false (and changes nothing) if unaffordable. */
-    suspend fun spendStars(amount: Int, reason: String): Boolean {
+/**
+ * Deducts [amount] stars. Returns false (and changes nothing) if unaffordable.
+ *
+ * [allowDebt] exists for the lottery only. Refusing a draw because the
+ * balance is short teaches the wrong lesson -- it turns "not yet" into "not
+ * allowed", and the child concludes the reward is not theirs to earn. The
+ * debt is visible on the balance instead, so it stays a debt rather than
+ * becoming a wall. Every other spender keeps the hard guard: spending on
+ * the pet must not be able to go further into debt.
+ */
+suspend fun spendStars(amount: Int, reason: String, allowDebt: Boolean = false): Boolean {
         if (amount <= 0) return true
         val balance = currentBalance()
-        if (balance < amount) return false
+        if (!allowDebt && balance < amount) return false
         starLedgerDao.insert(
             StarLedgerEntity(
                 delta = -amount,
@@ -196,32 +224,115 @@ class RanRepository(
 
     // ---------- Lottery ----------
 
+    /**
+     * Sets the star balance to exactly zero, whatever it was.
+     *
+     * Both directions are handled by clearing the ledger: the balance *is* the
+     * sum of its deltas, so an empty ledger is zero regardless of whether the
+     * balance was positive or negative. That also erases any accumulated debt,
+     * which is the point — a reset that left the balance at -30 would not be a
+     * reset.
+     *
+     * Check-ins, todos and review history are separate tables and are left
+     * alone: the stars are what gets cleared, not the effort behind them.
+     *
+     * @return number of ledger entries removed
+     */
+    suspend fun resetStarBalance(): Int = starLedgerDao.clearAll()
+
     val prizes: Flow<List<PrizeEntity>> = prizeDao.observeAll()
     val drawRecords: Flow<List<DrawRecordEntity>> = drawRecordDao.observeRecent()
 
-    suspend fun savePrize(prize: PrizeEntity): Long =
-        if (prize.id == 0L) prizeDao.insert(prize) else { prizeDao.update(prize); prize.id }
-
-    suspend fun deletePrize(prize: PrizeEntity) = prizeDao.delete(prize)
+    /**
+     * Saves a prize edit and rebalances the whole pool around it.
+     *
+     * Weights are percentages of a fixed 100, so changing one prize necessarily
+     * changes the others -- otherwise every displayed probability drifts out of
+     * step with the probabilities actually used by the draw. This lives here
+     * rather than in the editor so the invariant holds no matter which screen
+     * made the change.
+     *
+     * Written as a single transaction via [PrizeDao.replaceAll]: an interrupted
+     * rebalance would otherwise leave the pool summing to 93, and the user would
+     * have no way to tell that from an intentional edit.
+     */
+    suspend fun savePrize(prize: PrizeEntity) {
+        val pool = prizeDao.all()
+        if (prize.id == 0L) {
+            val (granted, others) = PrizeBalancer.admit(pool.map { it.weight }, prize.weight)
+            val inserted = prize.copy(weight = granted)
+            val id = prizeDao.insert(inserted)
+            prizeDao.replaceAll(
+                pool.mapIndexed { i, existing -> existing.copy(weight = others[i]) } +
+                    inserted.copy(id = id)
+            )
+            return
+        }
+        val index = pool.indexOfFirst { it.id == prize.id }
+        if (index < 0) {
+            prizeDao.insert(prize.copy(weight = PrizeBalancer.quantize(prize.weight)))
+            return
+        }
+        val rebalanced = PrizeBalancer.rebalance(pool.map { it.weight }, index, prize.weight)
+        // The edited prize keeps the weight that was typed and carries over every
+        // other field the caller changed; the rest take their computed share so
+        // the pool lands on exactly 100.
+        prizeDao.replaceAll(
+            pool.mapIndexed { i, existing ->
+                if (i != index) {
+                    existing.copy(weight = rebalanced[i])
+                } else {
+                    prize.copy(id = existing.id, weight = PrizeBalancer.quantize(prize.weight))
+                }
+            }
+        )
+    }
 
     /**
-     * Performs a weighted random draw. The star cost is taken from the drawn
-     * prize, which is known before the spend happens so the charge always
-     * matches the reward the user actually receives.
+     * Deletes a prize and hands its share back to the ones that remain.
+     *
+     * Without the redistribution the pool simply sums to less than 100, and
+     * every surviving prize quietly becomes likelier than its number claims --
+     * the one change users would never have made deliberately.
+     */
+    suspend fun deletePrize(prize: PrizeEntity) {
+        val pool = prizeDao.all()
+        val remaining = pool.filter { it.id != prize.id }
+        prizeDao.delete(prize)
+        if (remaining.isNotEmpty()) {
+            val rebalanced = PrizeBalancer.release(remaining.map { it.weight })
+            prizeDao.replaceAll(
+                remaining.mapIndexed { i, existing -> existing.copy(weight = rebalanced[i]) }
+            )
+        }
+    }
+
+    /**
+     * Performs one draw.
+     *
+     * The prize is chosen first and the cost charged afterwards. Charging first would
+     * make the balance decide the outcome; charging second means the draw is
+     * always honest and the debt, if any, is simply recorded.
+     *
+     * Weights are percentages summing to 100, so a weight reads directly as its
+     * share of the pool. See [com.ran.app.core.PrizeBalancer].
+     *
+     * The balance is allowed to go negative here and nowhere else (see
+     * [spendStars]).
      */
     suspend fun drawPrize(): DrawResult {
         val pool = prizeDao.activeOnce()
         if (pool.isEmpty()) return DrawResult.EmptyPool
+
         val winner = RewardEngine.weightedPick(pool, { it.weight }) ?: return DrawResult.EmptyPool
-        if (!spendStars(winner.starCost, "抽奖：${winner.title}")) return DrawResult.NotEnoughStars
-        // Jackpot is defined relative to pool cost so it stays meaningful as the user edits prizes.
-        val avgCost = pool.map { it.starCost }.average().coerceAtLeast(1.0)
-        val isJackpot = winner.starCost >= avgCost * 1.8
+        // Can no longer fail: the debt is permitted, so this is a plain debit.
+        spendStars(winner.starCost, "抽奖：${winner.title}", allowDebt = true)
+
         val record = DrawRecordEntity(
             prizeTitle = winner.title,
             prizeEmoji = winner.emoji,
             starCost = winner.starCost,
-            isJackpot = isJackpot,
+            isJackpot = winner.isJackpot,
             createdAt = TimeUtils.now()
         )
         drawRecordDao.insert(record)
@@ -257,8 +368,21 @@ class RanRepository(
         val nextCount = plan.currentCount + 1
         if (nextCount >= plan.targetCount) {
             planDao.bumpCount(planId, PlanStatus.COMPLETED, TimeUtils.now())
-            awardStars(RewardEngine.STAR_PLAN_COMPLETE + RewardEngine.STAR_CHECK_IN, "完成计划：${plan.title}")
-            return CheckInResult.Completed(planId)
+            // The final check-in pays the plan's own completion reward instead of
+            // a flat per-check-in amount. The editor calls this field "完成奖励"
+            // and the list shows "完成 +N⭐"; paying a hardcoded constant made
+            // both of those promises false.
+            val granted = RewardEngine.clampPlanReward(plan.starReward, plan.targetCount)
+            awardStars(granted, "完成计划：${plan.title}")
+            // Paid on top of the per-step reward, which the check-ins already
+            // handed out one at a time. Without it the endpoint of a hard plan
+            // was worth exactly the same as the endpoint of a trivial one.
+            awardStars(RewardEngine.STAR_PLAN_FINISH_BONUS, "达成目标：${plan.title}")
+            return CheckInResult.Completed(
+                planId,
+                granted,
+                RewardEngine.STAR_PLAN_FINISH_BONUS
+            )
         }
         planDao.bumpCount(planId, PlanStatus.ACTIVE, null)
         awardStars(RewardEngine.STAR_CHECK_IN, "打卡：${plan.title}")
@@ -301,18 +425,21 @@ class RanRepository(
      * ledger stays a truthful record of earned reward.
      */
     suspend fun toggleTodo(todo: TodoEntity): ToggleTodoResult? {
+        // Grant and refund both go through the cap, so a row written before the
+        // cap existed cannot be completed for 9999 and reopened for 9999 either.
+        val granted = RewardEngine.clampTodoReward(todo.starReward)
         if (!todo.isDone) {
             todoDao.update(
                 todo.copy(isDone = true, completedAt = TimeUtils.now())
             )
-            awardStars(todo.starReward, "完成任务：${todo.title}")
-            return ToggleTodoResult.Completed(todo.starReward)
+            awardStars(granted, "完成任务：${todo.title}")
+            return ToggleTodoResult.Completed(granted)
         }
         todoDao.update(todo.copy(isDone = false, completedAt = null))
         // Refund the stars originally granted. Guarded against a negative balance
         // so the ledger can never show a negative balance if data was edited.
         val balance = currentBalance()
-        val refund = todo.starReward.coerceAtMost(balance)
+        val refund = granted.coerceAtMost(balance)
         if (refund > 0) {
             starLedgerDao.insert(
                 StarLedgerEntity(
@@ -337,7 +464,7 @@ class RanRepository(
 
     suspend fun pickFood(): FoodEntity? {
         val pool = foodDao.activeOnce()
-        return RewardEngine.weightedPick(pool, { 1 })
+        return RewardEngine.weightedPick(pool)
     }
     // ---------- Pet ----------
 
@@ -543,25 +670,39 @@ class RanRepository(
      *
      * Newlines and sentence terminators are treated as boundaries, and each
      * piece is capped, so one paste becomes several honest little cards.
+     * Answers pair with questions **by line position**. Answers are optional and
+     * may be fewer than the questions: a question with no answer stays a valid
+     * card, it just has nothing to reveal. Pairing on position rather than on
+     * content is deliberate — content matching would silently attach the wrong
+     * answer after any reordering, which is worse than no answer at all.
      */
     suspend fun recordReviews(
-        rawText: String,
+        rawQuestions: String,
+        rawAnswers: String,
         difficulty: SpacedRepetition.Difficulty
     ): BatchReviewRecord {
-        val allLines = rawText.split(SENTENCE_SPLIT)
+        val allLines = rawQuestions.split(SENTENCE_SPLIT)
             .map { it.trim() }
             .filter { it.isNotEmpty() }
         val lines = allLines.take(MAX_CARDS_PER_BATCH)
         if (lines.isEmpty()) return BatchReviewRecord(starsGained = 0, created = 0, skipped = 0, tooLong = 0)
 
+        // Answers are split on newlines only: a fragmentary answer may legitimately
+        // contain a full stop, and cutting it at the punctuation would truncate it.
+        val answerPieces = rawAnswers.split('\n')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
         val tooLong = lines.count { it.length > MAX_CARD_LENGTH }
         var stars = 0
-        lines.forEach { content ->
-            val clamped = content.take(MAX_CARD_LENGTH)
+        lines.forEachIndexed { index, question ->
+            val clamped = question.take(MAX_CARD_LENGTH)
+            val answer = answerPieces.getOrNull(index)?.take(MAX_CARD_LENGTH).orEmpty()
             val now = TimeUtils.now()
             reviewDao.insert(
                 ReviewItemEntity(
                     content = clamped,
+                    answer = answer,
                     difficulty = difficulty.level,
                     ease = difficulty.initialEase,
                     createdAt = now,
@@ -630,8 +771,24 @@ class RanRepository(
             )
         )
         awardStars(stars, "复习：${item.content.take(30)}")
+
+        // Tier bonus for sustained review, counted on the log rather than in
+        // memory so it survives the process being killed and cannot be inflated
+        // by replaying a single session.
+        val day = TimeUtils.todayKey(now)
+        val reviewedToday = reviewLogDao.countReviewsOnDay(day)
+        val streakBonus = RewardEngine.reviewStreakBonus(reviewedToday)
+        val total = if (streakBonus > 0) {
+            awardStars(streakBonus, "今日第 $reviewedToday 张复习奖励")
+            stars + streakBonus
+        } else {
+            stars
+        }
+
         return ReviewOutcome(
-            starsGained = stars,
+            starsGained = total,
+            streakBonus = streakBonus,
+            reviewsToday = reviewedToday,
             nextDueDay = outcome.nextDueDay,
             intervalDays = outcome.intervalDays,
             mastered = outcome.isMastered,
@@ -669,37 +826,51 @@ class RanRepository(
 
     // ---------- Seeding ----------
 
-    /** Seeds a starter pool on first launch so the app is usable immediately. */
+    /**
+     * Seeds the prize catalogue on first launch, and after a migration that
+     * clears it.
+     *
+     * **The weight column IS the percentage.** Weights always sum to
+     * [com.ran.app.core.PrizeBalancer.TOTAL], so "16" reads as "16% chance" and
+     * the column needs no explanation to the person editing it.
+     *
+     * The shape: the top three carry 46% between them, so a child is rarely
+     * handed an empty screen — an empty screen is what actually ends the habit,
+     * not the absence of a big win. The middle band keeps a gradient between
+     * "trivial" and "rare" so the ladder does not collapse into two steps. The
+     * three dearest carry the jackpot flag, which marks them in the history
+     * list; it does not change how they are drawn.
+     */
     suspend fun seedIfEmpty() {
         if (prizeDao.count() == 0) {
             listOf(
-                // 小额高频：让抽奖经常有"到手"的实感
-                PrizeEntity(title = "小零食1份", description = "挑一个喜欢的", emoji = "🍪", weight = 22, starCost = 4),
-                PrizeEntity(title = "小水果1份", description = "当季水果", emoji = "🍎", weight = 24, starCost = 3),
-                PrizeEntity(title = "一杯饮料", description = "想喝什么自己选", emoji = "🥤", weight = 20, starCost = 5),
-                PrizeEntity(title = "免家务1次", description = "这次爸妈来做", emoji = "🧹", weight = 14, starCost = 8),
-                // 安慰奖：成本 0，不扣星星，也不算中奖
-                PrizeEntity(title = "谢谢惠顾", description = "这次没中，下次好运", emoji = "🍀", weight = 10, starCost = 0),
-                PrizeEntity(title = "屏幕时间+15分钟", description = "做完正事再玩", emoji = "📱", weight = 18, starCost = 5),
-                PrizeEntity(title = "屏幕时间+30分钟", description = "认真玩，不内疚", emoji = "🎮", weight = 13, starCost = 10),
-                PrizeEntity(title = "冰淇淋券1张", description = "饭后吃", emoji = "🍦", weight = 12, starCost = 8),
-                PrizeEntity(title = "屏幕时间+1小时", description = "周末可用", emoji = "🕹", weight = 8, starCost = 18),
-                PrizeEntity(title = "点外卖", description = "今天不做饭", emoji = "🥡", weight = 7, starCost = 18),
-                // 中档：需要攒一两天
-                PrizeEntity(title = "零花钱+5", description = "存起来也行", emoji = "💰", weight = 11, starCost = 12),
-                PrizeEntity(title = "奶茶券1张", description = "少糖更好", emoji = "🧋", weight = 10, starCost = 12),
-                PrizeEntity(title = "周末晚睡15分钟", description = "仅限周末", emoji = "🌙", weight = 9, starCost = 12),
-                PrizeEntity(title = "自选周末午餐", description = "你说了算", emoji = "🍱", weight = 9, starCost = 15),
-                PrizeEntity(title = "零花钱+10", description = "自己支配", emoji = "💵", weight = 7, starCost = 22),
-                PrizeEntity(title = "邀请同学来家玩（家长安排）", description = "提前约时间", emoji = "🧸", weight = 5, starCost = 25),
-                PrizeEntity(title = "买一本想要的书", description = "看完聊聊", emoji = "📚", weight = 5, starCost = 28),
-                PrizeEntity(title = "一场电影", description = "选片一起看", emoji = "🎬", weight = 4, starCost = 30),
-                PrizeEntity(title = "零花钱+15", description = "想好了再花", emoji = "💳", weight = 4, starCost = 32),
-                PrizeEntity(title = "吃大餐", description = "全家一起", emoji = "🍽", weight = 3, starCost = 35),
-                // 大奖：低概率，抽中即"头奖"（售价 >= 池子均价 1.8 倍）
-                PrizeEntity(title = "零花钱+20", description = "大额，好好计划", emoji = "🧧", weight = 2, starCost = 42),
-                PrizeEntity(title = "周末半日游", description = "去哪儿你定", emoji = "🚗", weight = 2, starCost = 50),
-                PrizeEntity(title = "中等玩具", description = "不超预算", emoji = "🎁", weight = 1, starCost = 55)
+                PrizeEntity(title = "1元", description = "零花钱起步", emoji = "🪙", weight = 16.0, starCost = 1),
+                PrizeEntity(title = "15分钟屏幕", description = "先做完正事", emoji = "⏱", weight = 16.0, starCost = 2),
+                PrizeEntity(title = "免一次家务", description = "这次爸妈来做", emoji = "🧹", weight = 14.0, starCost = 3),
+                PrizeEntity(title = "2元", description = "自己存着也行", emoji = "💰", weight = 6.0, starCost = 4),
+                PrizeEntity(title = "5元", description = "买点想吃的", emoji = "💵", weight = 6.0, starCost = 5),
+                PrizeEntity(title = "普通水果券", description = "当季水果，任选", emoji = "🍎", weight = 5.0, starCost = 6),
+                PrizeEntity(title = "10元", description = "零花钱升级", emoji = "💴", weight = 5.0, starCost = 8),
+                PrizeEntity(title = "大餐：牛排或羊排或海鲜", description = "全家一起吃好的", emoji = "🥩", weight = 4.0, starCost = 10),
+                PrizeEntity(title = "饮料券", description = "想喝什么自己选", emoji = "🥤", weight = 4.0, starCost = 12),
+                PrizeEntity(title = "15元", description = "可以计划一下", emoji = "💶", weight = 4.0, starCost = 14),
+                PrizeEntity(title = "看一场电影", description = "选片一起看", emoji = "🎬", weight = 3.0, starCost = 16),
+                PrizeEntity(title = "周末半日游", description = "去哪儿你定", emoji = "🚗", weight = 5.0, starCost = 18),
+                PrizeEntity(title = "贵重水果：车厘子，榴莲等", description = "当季最贵的那种", emoji = "🍒", weight = 4.0, starCost = 20),
+                PrizeEntity(title = "冰激凌券", description = "饭后吃", emoji = "🍦", weight = 2.0, starCost = 22),
+                PrizeEntity(title = "20元", description = "大额，好好计划", emoji = "🧧", weight = 2.0, starCost = 24),
+                PrizeEntity(
+                    title = "买书券", description = "看完聊聊", emoji = "📚",
+                    weight = 1.0, starCost = 26, isJackpot = true
+                ),
+                PrizeEntity(
+                    title = "周末晚睡15分钟特权1次", description = "仅限周末", emoji = "🌙",
+                    weight = 1.0, starCost = 28, isJackpot = true
+                ),
+                PrizeEntity(
+                    title = "30元", description = "头奖中的头奖", emoji = "🧨",
+                    weight = 2.0, starCost = 30, isJackpot = true
+                )
             ).forEach { prizeDao.insert(it) }
         }
         if (foodDao.count() == 0) {

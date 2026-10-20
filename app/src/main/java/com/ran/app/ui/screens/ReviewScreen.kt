@@ -83,11 +83,12 @@ fun ReviewScreen(
     allItems: List<ReviewItemEntity>,
     summary: ReviewSummary,
     modifier: Modifier = Modifier,
-    onAdd: (String, SpacedRepetition.Difficulty) -> Unit,
+    onAdd: (String, String, SpacedRepetition.Difficulty) -> Unit,
     onGrade: (ReviewItemEntity, SpacedRepetition.Quality) -> Unit,
     onDelete: (ReviewItemEntity) -> Unit
 ) {
     var draft by rememberSaveable { mutableStateOf("") }
+    var draftAnswer by rememberSaveable { mutableStateOf("") }
     var difficulty by rememberSaveable { mutableStateOf(SpacedRepetition.Difficulty.NORMAL) }
     var showAll by rememberSaveable { mutableStateOf(false) }
     var deleting by rememberSaveable { mutableStateOf<ReviewItemEntity?>(null) }
@@ -114,9 +115,26 @@ fun ReviewScreen(
                     value = draft,
                     onValueChange = { draft = it },
                     modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("比如：光合作用需要光、水和二氧化碳") },
+                    label = { Text("问题 / 要记住的内容") },
+                    placeholder = { Text("比如：光合作用需要哪些条件？") },
                     supportingText = { Text(text = draftHint(draft), style = MaterialTheme.typography.labelSmall) },
                     maxLines = 4,
+                    shape = RoundedCornerShape(14.dp)
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = draftAnswer,
+                    onValueChange = { draftAnswer = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("答案（可留空）") },
+                    placeholder = { Text("比如：光、水、二氧化碳") },
+                    supportingText = {
+                        Text(
+                            text = "留空则复习时只回看问题 · 多行答案按行对应多行问题",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    },
+                    maxLines = 3,
                     shape = RoundedCornerShape(14.dp)
                 )
                 Spacer(Modifier.height(10.dp))
@@ -135,8 +153,9 @@ fun ReviewScreen(
                     Button(
                         onClick = {
                             if (draft.isNotBlank()) {
-                                onAdd(draft, difficulty)
+                                onAdd(draft, draftAnswer, difficulty)
                                 draft = ""
+                                draftAnswer = ""
                             }
                         },
                         enabled = draft.isNotBlank()
@@ -358,9 +377,15 @@ private fun SelfTestCard(
                         subtitle = "${difficulty.label} · ${roundLabel(item)}"
                     )
                     Spacer(Modifier.height(14.dp))
-                    PromptBox(
-                        text = "闭上眼睛，试着把它说出来 👄",
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    // The question must be visible during recall. Showing only
+                    // "close your eyes and say it" gave the user nothing to
+                    // retrieve from, which is not a test at all.
+                    PromptBox(text = item.content, containerColor = AmberSoft)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "看着问题，先自己说出答案 👄",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     item.lastReviewedAt?.let {
                         Spacer(Modifier.height(8.dp))
@@ -381,7 +406,17 @@ private fun SelfTestCard(
                         subtitle = "诚实评分，间隔才算得准"
                     )
                     Spacer(Modifier.height(14.dp))
-                    PromptBox(text = item.content, containerColor = AmberSoft)
+                    PromptBox(
+                        label = "问题",
+                        text = item.content,
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    PromptBox(
+                        label = "答案",
+                        text = item.answer.ifBlank { "（这条没有填答案，只回看问题）" },
+                        containerColor = AmberSoft
+                    )
                     Spacer(Modifier.height(16.dp))
                     SpacedRepetition.Quality.entries.reversed().forEach { quality ->
                         val stars = SpacedRepetition.starsForReview(difficulty, quality)
@@ -399,7 +434,7 @@ private fun SelfTestCard(
 }
 
 @Composable
-private fun PromptBox(text: String, containerColor: Color) {
+private fun PromptBox(text: String, containerColor: Color, label: String? = null) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -409,11 +444,21 @@ private fun PromptBox(text: String, containerColor: Color) {
             .padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.titleMedium,
-            textAlign = TextAlign.Center
-        )
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            if (label != null) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(6.dp))
+            }
+            Text(
+                text = text,
+                style = MaterialTheme.typography.titleMedium,
+                textAlign = TextAlign.Center
+            )
+        }
     }
 }
 

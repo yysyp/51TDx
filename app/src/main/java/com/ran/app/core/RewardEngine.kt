@@ -32,11 +32,84 @@ object RewardEngine {
     /** Stars granted per plan check-in. */
     const val STAR_CHECK_IN = 3
 
-    /** Bonus granted once a plan reaches its target. */
-    const val STAR_PLAN_COMPLETE = 20
+    /**
+     * Ceiling on a plan reward *per target step*.
+     *
+     * A plan's completion reward scales with its target count, so the cap has to
+     * scale with it too: a flat ceiling would make a 2-step plan worth more than
+     * a 30-step plan, which inverts the incentive the target count is supposed to
+     * create. Five per step is therefore 15 for a 3-step plan and 150 for a
+     * 30-step plan — proportional, never disproportionately generous.
+     */
+    const val MAX_STAR_PER_CHECK_IN = 5
 
-    /** Stars granted for finishing a single todo. */
-    const val STAR_TODO_DONE = 5
+    /** Floor for a user-authored reward. Zero is allowed: not every task needs paying. */
+    const val MIN_TASK_REWARD = 0
+
+    /**
+     * Ceiling on a todo reward, which has no target count to scale by.
+     *
+     * Narrow on purpose. At 10 a single checkbox was worth more than a day of
+     * check-ins, which inverted the whole economy: the cheapest thing in the app
+     * became the best income per second, and todos degenerated into lottery
+     * fuel. Six keeps a todo worth completing without letting it out-earn
+     * showing up.
+     */
+    const val MAX_TODO_REWARD = 6
+
+    /**
+     * One-off bonus for reaching a plan's target.
+     *
+     * Without it, completing a long plan pays exactly what its check-ins already
+     * paid and nothing more -- so the plan's endpoint carried no extra weight
+     * and there was no reason to prefer a hard plan over an easy one. This is
+     * the "you finished something" payment, paid once.
+     */
+    const val STAR_PLAN_FINISH_BONUS = 10
+
+    /**
+     * Stars for the nth card reviewed on a single day.
+     *
+     * Reviews are the grind of this app and the first few are already paid at a
+     * sane rate; these tiers reward *sustained* effort rather than volume, and
+     * they cannot be farmed by opening the app in the morning and closing it at
+     * night because the count is per calendar day.
+     */
+    private val REVIEW_STREAK_TIERS = mapOf(3 to 2, 5 to 3, 8 to 5)
+
+    /** Default offered when creating a todo. */
+    const val DEFAULT_TODO_REWARD = 4
+
+    /** Target count assumed when none is supplied yet. */
+    const val DEFAULT_PLAN_TARGET = 21
+
+    private fun sanitizedTarget(targetCount: Int): Int = targetCount.coerceAtLeast(1)
+
+    /** Default plan completion reward: three stars per target step. */
+    fun defaultPlanReward(targetCount: Int): Int =
+        sanitizedTarget(targetCount) * STAR_CHECK_IN
+
+    /** Largest plan completion reward allowed: five stars per target step. */
+    fun maxPlanReward(targetCount: Int): Int =
+        sanitizedTarget(targetCount) * MAX_STAR_PER_CHECK_IN
+
+    /**
+     * Clamps a plan's completion reward to 0..[maxPlanReward].
+     *
+     * Runs on the granting path as well as the editor: rows written before the cap
+     * existed may still hold absurd values, and a limit enforced only in the UI is
+     * not a limit.
+     */
+    fun clampPlanReward(input: Int?, targetCount: Int): Int {
+        val value = input ?: defaultPlanReward(targetCount)
+        return value.coerceIn(MIN_TASK_REWARD, maxPlanReward(targetCount))
+    }
+
+    /** Clamps a todo reward to 0..[MAX_TODO_REWARD]. */
+    fun clampTodoReward(input: Int?, fallback: Int = DEFAULT_TODO_REWARD): Int {
+        val value = input ?: fallback
+        return value.coerceIn(MIN_TASK_REWARD, MAX_TODO_REWARD)
+    }
 
     // ---- Variable-ratio reward on reviews ----
     //
@@ -66,22 +139,54 @@ object RewardEngine {
     /** Baseline stars the daily goal starts from (endowed-progress effect). */
     const val DAILY_GOAL_BASE = 10
 
-    /** Daily star target. Reached easily, then the day reads as "won". */
-    const val DAILY_GOAL_TARGET = 60
+    /**
+     * Daily star target.
+     *
+     * Was 60, against a realistic daily yield of ~38: the bar could not be
+     * filled by an active user, which turns the one progress element on the home
+     * screen into a standing reminder of falling short. Forty sits above a light
+     * day and below a full one, so reaching it means something and missing it
+     * still leaves the day winnable.
+     */
+    const val DAILY_GOAL_TARGET = 40
+
+    /**
+     * Bonus when [count]-th card of the day is reviewed, or 0 if that tier has
+     * not been reached. Paid once per tier per day.
+     */
+    fun reviewStreakBonus(count: Int): Int = REVIEW_STREAK_TIERS[count] ?: 0
 
     /** Weighted pick honouring each prize's [com.ran.app.data.local.PrizeEntity.weight]. */
-    fun <T> weightedPick(items: List<T>, weightOf: (T) -> Int, random: Random = Random.Default): T? {
+    /**
+     * Weighted random draw.
+     *
+     * Weights are lifted to hundredths internally so the roulette stays exact:
+     * stepping with [Double] and comparing against a random [Double] accumulates
+     * error, which silently biases the tail of a large pool.
+     *
+     * @param weightOf weight per item; non-positive weights are floored to zero
+     * @return the drawn item, or null when [items] is empty
+     */
+    fun <T> weightedPick(
+        items: List<T>,
+        weightOf: (T) -> Double,
+        random: Random = Random.Default
+    ): T? {
         if (items.isEmpty()) return null
-        val sanitized = items.map { weightOf(it).coerceAtLeast(1) }
+        val sanitized = items.map { (weightOf(it).coerceAtLeast(0.0) * 100).toLong() }
         val total = sanitized.sum()
-        if (total <= 0) return items.random(random)
-        var roll = random.nextInt(total)
+        if (total <= 0L) return items.random(random)
+        var roll = random.nextLong(total)
         items.forEachIndexed { index, item ->
             roll -= sanitized[index]
             if (roll < 0) return item
         }
         return items.last()
     }
+
+    /** Uniform draw, for callers that do not weight. */
+    fun <T> weightedPick(items: List<T>, random: Random = Random.Default): T? =
+        weightedPick(items, { 1.0 }, random)
 
     /**
      * Linear ratio for storage/reporting; UI should prefer [easedProgress] to
